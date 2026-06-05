@@ -1,0 +1,132 @@
+// Copyright 2025-2026 Ant Group Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "qwen35_decode_common.cuh"
+#include "qwen35_layout_kernel.hpp"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAUtils.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/util/Exception.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+void check_tensor_device(const at::Tensor& tensor, const char* name, const at::Device& device) {
+  TORCH_CHECK(tensor.device() == device, name, " must be on device ", device, ".");
+}
+
+void check_tensor_shape_2d(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(
+      tensor.dim() == 2,
+      name,
+      " must have rank 2, but got rank ",
+      tensor.dim(),
+      ".");
+}
+
+} // namespace
+
+namespace cula::qwen35::decode {
+
+void run_qwen35_layout_decode(LayoutDecodeParams& params) {
+  const at::Tensor& mixed_qkv_conv = params.mixed_qkv_conv;
+  const at::Tensor& a = params.a;
+  const at::Tensor& b = params.b;
+  const at::Tensor& q_rep = params.q_rep;
+  const at::Tensor& k_rep = params.k_rep;
+  const at::Tensor& v = params.v;
+  const at::Tensor& a_kernel = params.a_kernel;
+  const at::Tensor& b_kernel = params.b_kernel;
+
+  TORCH_CHECK(mixed_qkv_conv.is_cuda(), "mixed_qkv_conv must be a CUDA tensor.");
+  TORCH_CHECK(mixed_qkv_conv.is_contiguous(), "mixed_qkv_conv must be contiguous.");
+  TORCH_CHECK(
+      mixed_qkv_conv.scalar_type() == a.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == b.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == q_rep.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == k_rep.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == v.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == a_kernel.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == b_kernel.scalar_type(),
+      "All layout decode tensors must share the same dtype.");
+
+  check_tensor_shape_2d(a, "a");
+  check_tensor_shape_2d(b, "b");
+
+  TORCH_CHECK(
+      mixed_qkv_conv.dim() == 2 && mixed_qkv_conv.size(1) == kMixedQKVDim,
+      "mixed_qkv_conv must have shape [N, 10240].");
+
+  const int64_t batch_size = mixed_qkv_conv.size(0);
+  const at::Device device = mixed_qkv_conv.device();
+
+  check_tensor_device(a, "a", device);
+  check_tensor_device(b, "b", device);
+  check_tensor_device(q_rep, "q_rep", device);
+  check_tensor_device(k_rep, "k_rep", device);
+  check_tensor_device(v, "v", device);
+  check_tensor_device(a_kernel, "a_kernel", device);
+  check_tensor_device(b_kernel, "b_kernel", device);
+
+  TORCH_CHECK(q_rep.is_contiguous(), "q_rep must be contiguous.");
+  TORCH_CHECK(k_rep.is_contiguous(), "k_rep must be contiguous.");
+  TORCH_CHECK(v.is_contiguous(), "v must be contiguous.");
+  TORCH_CHECK(a_kernel.is_contiguous(), "a_kernel must be contiguous.");
+  TORCH_CHECK(b_kernel.is_contiguous(), "b_kernel must be contiguous.");
+
+  TORCH_CHECK(
+      q_rep.dim() == 3 && q_rep.sizes() == at::IntArrayRef({batch_size, kNumVHeads, kHeadDimQK}),
+      "q_rep must have shape [N, 48, 128].");
+  TORCH_CHECK(
+      k_rep.dim() == 3 && k_rep.sizes() == at::IntArrayRef({batch_size, kNumVHeads, kHeadDimQK}),
+      "k_rep must have shape [N, 48, 128].");
+  TORCH_CHECK(
+      v.dim() == 3 && v.sizes() == at::IntArrayRef({batch_size, kNumVHeads, kHeadDimV}),
+      "v must have shape [N, 48, 128].");
+  TORCH_CHECK(
+      a_kernel.dim() == 2 && a_kernel.sizes() == at::IntArrayRef({batch_size, kNumVHeads}),
+      "a_kernel must have shape [N, 48].");
+  TORCH_CHECK(
+      b_kernel.dim() == 2 && b_kernel.sizes() == at::IntArrayRef({batch_size, kNumVHeads}),
+      "b_kernel must have shape [N, 48].");
+
+  TORCH_CHECK(a.sizes() == at::IntArrayRef({batch_size, kNumVHeads}), "a must have shape [N, 48].");
+  TORCH_CHECK(b.sizes() == at::IntArrayRef({batch_size, kNumVHeads}), "b must have shape [N, 48].");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
+  constexpr int threads = 32;
+  dim3 grid(kNumVHeads, static_cast<unsigned int>(batch_size), 1);
+  cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      mixed_qkv_conv.scalar_type(),
+      "qwen35_layout_decode_kernel_cute",
+      [&] {
+        qwen35_layout_decode_kernel_cute<scalar_t><<<grid, threads, 0, stream>>>(
+            mixed_qkv_conv.data_ptr<scalar_t>(),
+            a.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            q_rep.data_ptr<scalar_t>(),
+            k_rep.data_ptr<scalar_t>(),
+            v.data_ptr<scalar_t>(),
+            a_kernel.data_ptr<scalar_t>(),
+            b_kernel.data_ptr<scalar_t>(),
+            batch_size);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+} // namespace cula::qwen35::decode
