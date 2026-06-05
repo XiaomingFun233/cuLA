@@ -12,93 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL kernel for Qwen3.5 single-token conv-state update."""
+"""Qwen3.5 single-token conv-state update wrapper."""
 
 from __future__ import annotations
 
-import functools
-
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
 
-THREADS = 256
-KERNEL_SIZE = 4
-
-
-@cute.kernel
-def _qwen35_conv1d_decode_kernel(
-    x_t: cute.Tensor,
-    conv_state: cute.Tensor,
-    weight: cute.Tensor,
-    y: cute.Tensor,
-    B: cutlass.Constexpr[int],
-    C: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    linear_idx = bidx * THREADS + tidx
-    if linear_idx < B * C:
-        b = linear_idx // C
-        c = linear_idx % C
-
-        s0 = cutlass.Float32(conv_state[(b, c, 1)])
-        s1 = cutlass.Float32(conv_state[(b, c, 2)])
-        s2 = cutlass.Float32(conv_state[(b, c, 3)])
-        s3 = cutlass.Float32(x_t[(b, c)])
-
-        w0 = cutlass.Float32(weight[(c, 0)])
-        w1 = cutlass.Float32(weight[(c, 1)])
-        w2 = cutlass.Float32(weight[(c, 2)])
-        w3 = cutlass.Float32(weight[(c, 3)])
-
-        out = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3
-        sig = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-out))
-        out = out * sig
-
-        conv_state[(b, c, 0)] = cutlass.BFloat16(s0)
-        conv_state[(b, c, 1)] = cutlass.BFloat16(s1)
-        conv_state[(b, c, 2)] = cutlass.BFloat16(s2)
-        conv_state[(b, c, 3)] = cutlass.BFloat16(s3)
-        y[(b, c)] = cutlass.BFloat16(out)
+try:
+    import cula.cudac as cula_cuda
+except ImportError:
+    cula_cuda = None
 
 
-@cute.jit
-def _run_qwen35_conv1d_decode(
-    x_t: cute.Tensor,
-    conv_state: cute.Tensor,
-    weight: cute.Tensor,
-    y: cute.Tensor,
-    B: cutlass.Constexpr[int],
-    C: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    stream: cuda.CUstream,
-):
-    _qwen35_conv1d_decode_kernel(
-        x_t,
-        conv_state,
-        weight,
-        y,
-        B,
-        C,
-        K,
-    ).launch(
-        grid=(cute.ceil_div(B * C, THREADS), 1, 1),
-        block=(THREADS, 1, 1),
-        stream=stream,
-    )
+def qwen35_conv1d_decode_reference(
+    x_t: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure torch reference for Qwen3.5 single-token depthwise conv decode."""
+    if weight.ndim == 3:
+        weight = weight.squeeze(1)
 
+    state_tail = conv_state[..., 1:].to(torch.float32)
+    x_last = x_t.unsqueeze(-1).to(torch.float32)
+    window = torch.cat([state_tail, x_last], dim=-1)
+    conv = (window * weight.to(torch.float32).unsqueeze(0)).sum(dim=-1)
+    y = torch.nn.functional.silu(conv).to(dtype=x_t.dtype)
 
-@functools.cache
-def _get_compiled_kernel(
-    B: int,
-    C: int,
-    K: int,
-):
-    return {}
+    conv_state_out = conv_state.clone()
+    conv_state_out[..., 0] = conv_state[..., 1]
+    conv_state_out[..., 1] = conv_state[..., 2]
+    conv_state_out[..., 2] = conv_state[..., 3]
+    conv_state_out[..., 3] = x_t
+    return y, conv_state_out
 
 
 def qwen35_conv1d_decode_update(
@@ -107,6 +53,7 @@ def qwen35_conv1d_decode_update(
     weight: torch.Tensor,
     *,
     activation: str = "silu",
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-token depthwise causal conv1d update.
 
@@ -145,26 +92,28 @@ def qwen35_conv1d_decode_update(
     x_t = x_t.contiguous()
     conv_state = conv_state.contiguous()
     weight_2d = weight_2d.contiguous()
-    y = torch.empty_like(x_t)
 
-    B, C = x_t.shape
-    cache = _get_compiled_kernel(B, C, kernel_size)
-    if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        compiled = cute.compile(
-            _run_qwen35_conv1d_decode,
-            from_dlpack(x_t, assumed_align=16),
-            from_dlpack(conv_state, assumed_align=16),
-            from_dlpack(weight_2d, assumed_align=16),
-            from_dlpack(y, assumed_align=16),
-            B=B,
-            C=C,
-            K=kernel_size,
-            stream=stream,
-            options="--enable-tvm-ffi",
+    use_cudac = (
+        backend in ("auto", "cudac")
+        and cula_cuda is not None
+        and hasattr(cula_cuda, "qwen35_conv1d_decode")
+        and x_t.is_cuda
+    )
+    if backend == "cudac" and not use_cudac:
+        raise RuntimeError("Requested backend='cudac' but qwen35_conv1d_decode is not available.")
+
+    if use_cudac:
+        mixed_qkv_3d = x_t.unsqueeze(1).contiguous()
+        out_3d = torch.empty_like(mixed_qkv_3d)
+        conv_state_out = conv_state.clone()
+        cula_cuda.qwen35_conv1d_decode(
+            mixed_qkv_3d,
+            conv_state_out,
+            weight_2d,
+            out_3d,
         )
-        cache["compiled"] = compiled
+        return out_3d.squeeze(1), conv_state_out
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    cache["compiled"](x_t, conv_state, weight_2d, y, stream)
-    return y, conv_state
+    if backend not in ("auto", "reference"):
+        raise ValueError(f"Unsupported backend={backend}")
+    return qwen35_conv1d_decode_reference(x_t, conv_state, weight_2d)

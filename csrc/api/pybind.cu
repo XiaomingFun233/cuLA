@@ -17,6 +17,8 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
+#include "qwen35/decode/qwen35_decode_common.cuh"
+
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
 ChunkKDAFwdIntra(
@@ -68,6 +70,71 @@ kda_fwd_prefill(
     bool safe_gate);
 #endif
 
+void
+qwen35_conv1d_decode(
+    at::Tensor mixed_qkv,
+    at::Tensor conv_state,
+    at::Tensor conv_weight,
+    at::Tensor out) {
+    cula::qwen35::decode::ConvDecodeParams params{
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        out,
+    };
+    cula::qwen35::decode::run_qwen35_conv1d_decode(params);
+}
+
+void
+qwen35_layout_decode(
+    at::Tensor mixed_qkv_conv,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor q_rep,
+    at::Tensor k_rep,
+    at::Tensor v,
+    at::Tensor a_kernel,
+    at::Tensor b_kernel) {
+    cula::qwen35::decode::LayoutDecodeParams params{
+        mixed_qkv_conv,
+        a,
+        b,
+        q_rep,
+        k_rep,
+        v,
+        a_kernel,
+        b_kernel,
+    };
+    cula::qwen35::decode::run_qwen35_layout_decode(params);
+}
+
+void
+qwen35_scalar_kda_decode(
+    at::Tensor q_rep,
+    at::Tensor k_rep,
+    at::Tensor v,
+    at::Tensor a_kernel,
+    at::Tensor b_kernel,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    at::Tensor recurrent_state,
+    at::Tensor pool_idx,
+    at::Tensor out) {
+    cula::qwen35::decode::ScalarKdaDecodeParams params{
+        q_rep,
+        k_rep,
+        v,
+        a_kernel,
+        b_kernel,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        pool_idx,
+        out,
+    };
+    cula::qwen35::decode::run_qwen35_scalar_kda_decode(params);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
@@ -77,4 +144,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
 #endif
+    m.def("qwen35_conv1d_decode", &qwen35_conv1d_decode);
+    m.def("qwen35_layout_decode", &qwen35_layout_decode);
+    m.def("qwen35_scalar_kda_decode", &qwen35_scalar_kda_decode);
 }

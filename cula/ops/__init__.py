@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
-from cula.ops.la_decode import linear_attention_decode
+try:
+    from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+except Exception:  # pragma: no cover - optional runtime dependency
+    fused_sigmoid_gating_delta_rule_update = None
+    kda_decode = None
 
-__all__ = [
-    "kda_decode",
-    "fused_sigmoid_gating_delta_rule_update",
-    "linear_attention_decode",
-]
+try:
+    from cula.ops.la_decode import linear_attention_decode
+except Exception:  # pragma: no cover - optional runtime dependency
+    linear_attention_decode = None
+
+__all__ = ["kda_decode", "fused_sigmoid_gating_delta_rule_update", "linear_attention_decode"]

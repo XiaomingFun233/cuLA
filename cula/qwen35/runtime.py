@@ -16,8 +16,12 @@
 
 from __future__ import annotations
 
-import cuda.bindings.driver as cuda
 import torch
+
+try:
+    import cuda.bindings.driver as cuda
+except ImportError:  # pragma: no cover - optional runtime dependency
+    cuda = None
 
 from cula.qwen35.common import (
     DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
@@ -28,17 +32,113 @@ from cula.qwen35.common import (
     validate_state_tensors,
 )
 from cula.ops.qwen35_conv1d_decode import qwen35_conv1d_decode_update
+from cula.ops.qwen35_layout_decode import qwen35_layout_decode
 from cula.ops.qwen35_scalar_kda_decode import qwen35_scalar_kda_decode
 
-_stream_cache: dict[tuple[str, int], cuda.CUstream] = {}
+_stream_cache: dict[tuple[str, int], object] = {}
 
 
-def _get_cached_stream(device: torch.device) -> cuda.CUstream:
+def _get_cached_stream(device: torch.device) -> object:
+    if cuda is None:
+        raise RuntimeError("cuda.bindings.driver is not available in this environment.")
     stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
     cache_key = (str(device), stream_id)
     if cache_key not in _stream_cache:
         _stream_cache[cache_key] = cuda.CUstream(stream_id)
     return _stream_cache[cache_key]
+
+
+def _torch_qwen35_scalar_kda_decode_reference(
+    q_rep: torch.Tensor,
+    k_rep: torch.Tensor,
+    v: torch.Tensor,
+    a_kernel: torch.Tensor,
+    b_kernel: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure torch reference for Qwen3.5 scalar-gated decode."""
+    tokens, num_v_heads, head_k_dim = q_rep.shape
+    head_v_dim = v.shape[-1]
+    state_out = recurrent_state.clone()
+    out = torch.empty(tokens, num_v_heads, head_v_dim, device=q_rep.device, dtype=q_rep.dtype)
+
+    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1)
+    k_f = torch.nn.functional.normalize(k_rep.float(), dim=-1)
+    v_f = v.float()
+    a_f = a_kernel.float()
+    b_f = b_kernel.float()
+
+    for token_idx in range(tokens):
+        pool_idx = int(state_indices[token_idx].item())
+        for hv in range(num_v_heads):
+            state_kv = state_out[pool_idx, hv]
+            state_vk = state_kv.transpose(0, 1).contiguous()
+
+            decay_pre = a_f[token_idx, hv] + dt_bias[hv]
+            decay = torch.exp(-torch.exp(A_log[hv]) * torch.nn.functional.softplus(decay_pre))
+            beta = torch.sigmoid(b_f[token_idx, hv])
+
+            k_vec = k_f[token_idx, hv]
+            q_vec = q_f[token_idx, hv]
+
+            proj = state_vk @ k_vec
+            v_new = beta * (v_f[token_idx, hv] - proj)
+            state_vk_new = decay * state_vk + v_new.unsqueeze(1) * k_vec.unsqueeze(0)
+            out[token_idx, hv] = (state_vk_new @ q_vec).to(out.dtype)
+            state_out[pool_idx, hv] = state_vk_new.transpose(0, 1).contiguous()
+
+    return out, state_out
+
+
+def qwen35_linear_attention_decode_reference(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    conv_weight: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    config: Qwen35LinearAttentionConfig = DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
+    conv_state: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure torch reference for the full Qwen3.5 decode chain."""
+    tokens = mixed_qkv.shape[0]
+    if state_indices is None:
+        state_indices = torch.arange(tokens, device=mixed_qkv.device, dtype=torch.int32)
+    else:
+        state_indices = state_indices.to(device=mixed_qkv.device, dtype=torch.int32)
+
+    conv_out, conv_state_out = qwen35_conv1d_decode_update(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        activation="silu",
+        backend="reference",
+    )
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode(
+        conv_out,
+        a,
+        b,
+        config=config,
+        backend="reference",
+    )
+    core_attn_out, recurrent_state_out = _torch_qwen35_scalar_kda_decode_reference(
+        q_rep,
+        k_rep,
+        v,
+        a_kernel,
+        b_kernel,
+        A_log.float(),
+        dt_bias.float(),
+        recurrent_state.float(),
+        state_indices,
+    )
+    return core_attn_out.reshape(tokens, -1), conv_state_out, recurrent_state_out
 
 
 def qwen35_linear_attention_prefill(
@@ -80,6 +180,7 @@ def qwen35_linear_attention_decode(
     conv_state: torch.Tensor,
     recurrent_state: torch.Tensor,
     state_indices: torch.Tensor | None = None,
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Qwen3.5 decode wrapper.
 
@@ -100,7 +201,8 @@ def qwen35_linear_attention_decode(
     validate_mixed_qkv(mixed_qkv, config)
     validate_scalar_gate_inputs(a, b, config)
     validate_state_tensors(conv_state, recurrent_state, config)
-    _get_cached_stream(mixed_qkv.device)
+    if mixed_qkv.is_cuda:
+        _get_cached_stream(mixed_qkv.device)
 
     if mixed_qkv.shape[0] != a.shape[0]:
         raise ValueError(f"Token dimension mismatch, got mixed_qkv={tuple(mixed_qkv.shape)} a={tuple(a.shape)}")
@@ -128,38 +230,52 @@ def qwen35_linear_attention_decode(
     if A_log.numel() != local_num_v_heads:
         raise ValueError(f"A_log must match local_num_v_heads={local_num_v_heads}, got {A_log.numel()}")
 
+    if backend == "auto" and not mixed_qkv.is_cuda:
+        backend = "reference"
+
+    if backend == "reference":
+        return qwen35_linear_attention_decode_reference(
+            mixed_qkv,
+            a,
+            b,
+            conv_weight,
+            A_log,
+            dt_bias,
+            config=config,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            state_indices=state_indices,
+        )
+
     conv_out, conv_state_out = qwen35_conv1d_decode_update(
         mixed_qkv,
         conv_state,
         conv_weight,
         activation="silu",
+        backend=backend,
     )
-
-    q_end = local_key_dim
-    k_end = q_end + local_key_dim
-    q_flat = conv_out[:, :q_end]
-    k_flat = conv_out[:, q_end:k_end]
-    v_flat = conv_out[:, k_end:]
-
-    q = q_flat.view(tokens, local_num_k_heads, config.head_k_dim)
-    k = k_flat.view(tokens, local_num_k_heads, config.head_k_dim)
-    v = v_flat.view(tokens, local_num_v_heads, config.head_v_dim)
-
-    repeat_factor = local_num_v_heads // local_num_k_heads
-    q = q.repeat_interleave(repeat_factor, dim=1).unsqueeze(1).contiguous()
-    k = k.repeat_interleave(repeat_factor, dim=1).unsqueeze(1).contiguous()
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode(
+        conv_out,
+        a,
+        b,
+        config=config,
+        backend=backend,
+    )
+    q = q_rep.unsqueeze(1).contiguous()
+    k = k_rep.unsqueeze(1).contiguous()
     v = v.unsqueeze(1).contiguous()
 
     core_attn_out, recurrent_state_out = qwen35_scalar_kda_decode(
         q=q,
         k=k,
         v=v,
-        a=a,
-        b=b,
+        a=a_kernel,
+        b=b_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
         recurrent_state=recurrent_state,
         state_indices=state_indices,
+        backend=backend,
     )
     core_attn_out = core_attn_out.reshape(tokens, local_value_dim)
     return core_attn_out, conv_state_out, recurrent_state_out

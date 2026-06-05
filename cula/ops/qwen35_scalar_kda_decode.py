@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import torch
 
-from cula.ops.kda_decode import kda_decode
+try:
+    import cula.cudac as cula_cuda
+except ImportError:
+    cula_cuda = None
 
 
 def qwen35_scalar_kda_decode(
@@ -32,6 +35,7 @@ def qwen35_scalar_kda_decode(
     recurrent_state: torch.Tensor,
     *,
     state_indices: torch.Tensor | None = None,
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-token scalar-gated delta-rule decode for Qwen3.5."""
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -51,13 +55,50 @@ def qwen35_scalar_kda_decode(
     if A_log.shape != (HV,) or dt_bias.shape != (HV,):
         raise ValueError(f"A_log/dt_bias must be [HV], got A_log={tuple(A_log.shape)} dt_bias={tuple(dt_bias.shape)}")
 
-    a_expanded = a.unsqueeze(-1).expand(N, 1, HV, K)
-    dt_bias_expanded = dt_bias[:, None].expand(HV, K).contiguous()
     state_indices = (
         torch.arange(N, device=q.device, dtype=torch.int32)
         if state_indices is None
         else state_indices.to(device=q.device, dtype=torch.int32)
     )
+
+    use_cudac = (
+        backend in ("auto", "cudac")
+        and cula_cuda is not None
+        and hasattr(cula_cuda, "qwen35_scalar_kda_decode")
+        and q.is_cuda
+    )
+    if backend == "cudac" and not use_cudac:
+        raise RuntimeError("Requested backend='cudac' but qwen35_scalar_kda_decode is not available.")
+
+    if use_cudac:
+        q_rep = q.squeeze(1).contiguous()
+        k_rep = k.squeeze(1).contiguous()
+        v_rep = v.squeeze(1).contiguous()
+        a_kernel = a.squeeze(1).contiguous()
+        b_kernel = b.squeeze(1).contiguous()
+        out = torch.empty_like(v_rep)
+        recurrent_state_out = recurrent_state.clone()
+        cula_cuda.qwen35_scalar_kda_decode(
+            q_rep,
+            k_rep,
+            v_rep,
+            a_kernel,
+            b_kernel,
+            A_log.contiguous(),
+            dt_bias.contiguous(),
+            recurrent_state_out,
+            state_indices,
+            out,
+        )
+        return out.unsqueeze(1), recurrent_state_out
+
+    if backend not in ("auto", "generic_kda"):
+        raise ValueError(f"Unsupported backend={backend}")
+
+    from cula.ops.kda_decode import kda_decode
+
+    a_expanded = a.unsqueeze(-1).expand(N, 1, HV, K)
+    dt_bias_expanded = dt_bias[:, None].expand(HV, K).contiguous()
     o = kda_decode(
         A_log=A_log.contiguous(),
         dt_bias=dt_bias_expanded,

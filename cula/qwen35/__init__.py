@@ -15,13 +15,14 @@
 """Qwen3.5-specific linear attention support built on top of cuLA primitives."""
 
 from cula.qwen35.common import Qwen35LinearAttentionConfig
-from cula.qwen35.runtime import (
-    qwen35_linear_attention_decode,
-    qwen35_linear_attention_prefill,
-)
 
-__all__ = [
-    "Qwen35LinearAttentionConfig",
-    "qwen35_linear_attention_prefill",
-    "qwen35_linear_attention_decode",
-]
+try:
+    from cula.qwen35.runtime import (
+        qwen35_linear_attention_decode,
+        qwen35_linear_attention_prefill,
+    )
+except Exception:  # pragma: no cover - optional runtime dependency during partial imports
+    qwen35_linear_attention_decode = None
+    qwen35_linear_attention_prefill = None
+
+__all__ = ["Qwen35LinearAttentionConfig", "qwen35_linear_attention_prefill", "qwen35_linear_attention_decode"]
