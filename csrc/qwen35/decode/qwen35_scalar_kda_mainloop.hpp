@@ -380,10 +380,10 @@ struct Qwen35ScalarKdaDecodeMainloop {
     //   registers across both proj and update/out passes with acceptable
     //   register pressure
 
-    const float a_val = static_cast<float>(a_scalar());
-    const float b_val = static_cast<float>(b_scalar());
-    const float A_log_val = static_cast<float>(A_log_scalar());
-    const float dt_bias_val = static_cast<float>(dt_bias_scalar());
+    const float a_val = static_cast<float>(a_scalar);
+    const float b_val = static_cast<float>(b_scalar);
+    const float A_log_val = static_cast<float>(A_log_scalar);
+    const float dt_bias_val = static_cast<float>(dt_bias_scalar);
 
     const float g = -expf(A_log_val) * softplusf_approx(a_val + dt_bias_val);
     const float decay = expf(g);

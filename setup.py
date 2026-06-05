@@ -147,6 +147,9 @@ else:
 
 cuda_sources = [
     "csrc/api/pybind.cu",
+    "csrc/qwen35/decode/qwen35_conv1d_decode.cu",
+    "csrc/qwen35/decode/qwen35_layout_decode.cu",
+    "csrc/qwen35/decode/qwen35_scalar_kda_decode.cu",
 ]
 if not DISABLE_SM100 or not DISABLE_SM103:
     cuda_sources.extend(

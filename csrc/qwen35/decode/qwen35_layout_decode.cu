@@ -22,6 +22,8 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+namespace {
+
 void check_tensor_device(const at::Tensor& tensor, const char* name, const at::Device& device) {
   TORCH_CHECK(tensor.device() == device, name, " must be on device ", device, ".");
 }
