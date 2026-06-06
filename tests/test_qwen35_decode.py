@@ -26,9 +26,24 @@ from cula.ops.qwen35_layout_decode import qwen35_layout_decode, qwen35_layout_de
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG
 from cula.qwen35.runtime import qwen35_linear_attention_decode
 
+try:
+    import cula.cudac as cula_cuda
+except ImportError:
+    cula_cuda = None
+
 
 def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _has_qwen35_cudac():
+    return (
+        torch.cuda.is_available()
+        and cula_cuda is not None
+        and hasattr(cula_cuda, "qwen35_conv1d_decode")
+        and hasattr(cula_cuda, "qwen35_layout_decode")
+        and hasattr(cula_cuda, "qwen35_scalar_kda_decode")
+    )
 
 
 def make_inputs(tokens: int = 2, pool_size: int = 3, device: torch.device | None = None):
@@ -88,7 +103,8 @@ def manual_qwen35_decode_reference(
     q_rep = q.repeat_interleave(config.qk_repeat_factor, dim=1)
     k_rep = k.repeat_interleave(config.qk_repeat_factor, dim=1)
 
-    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1)
+    scale = config.head_k_dim**-0.5
+    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1) * scale
     k_f = torch.nn.functional.normalize(k_rep.float(), dim=-1)
     v_f = v.float()
     state_out = recurrent_state.clone()
@@ -103,7 +119,7 @@ def manual_qwen35_decode_reference(
             beta = torch.sigmoid(b[token_idx, hv].float())
             k_vec = k_f[token_idx, hv]
             q_vec = q_f[token_idx, hv]
-            proj = state_kv.transpose(0, 1) @ k_vec
+            proj = decay * (state_kv.transpose(0, 1) @ k_vec)
             v_new = beta * (v_f[token_idx, hv] - proj)
             state_new_kv = decay * state_kv + k_vec.unsqueeze(1) * v_new.unsqueeze(0)
             per_token.append((state_new_kv.transpose(0, 1) @ q_vec).to(mixed_qkv.dtype))
@@ -165,3 +181,68 @@ def test_qwen35_decode_reference_chain(tokens: int):
     assert torch.allclose(out_ref.float(), out.float(), atol=1e-5, rtol=1e-5)
     assert torch.equal(conv_state_ref, conv_state_out)
     assert torch.allclose(recurrent_state_ref, recurrent_state_out, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
+@pytest.mark.parametrize("tokens", [1, 2, 4])
+def test_qwen35_decode_cudac_matches_reference(tokens: int):
+    # Decode batches represent distinct active sequences, so keep state rows unique
+    # to avoid intentionally racing multiple token updates against one cache row.
+    mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices = make_inputs(
+        tokens=tokens,
+        pool_size=max(tokens, 3),
+        device=torch.device("cuda"),
+    )
+    out_ref, conv_state_ref, recurrent_state_ref = qwen35_linear_attention_decode(
+        mixed_qkv,
+        a,
+        b,
+        conv_weight,
+        A_log,
+        dt_bias,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        backend="reference",
+    )
+    out, conv_state_out, recurrent_state_out = qwen35_linear_attention_decode(
+        mixed_qkv,
+        a,
+        b,
+        conv_weight,
+        A_log,
+        dt_bias,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    assert torch.allclose(out_ref.float(), out.float(), atol=3e-2, rtol=3e-2)
+    assert torch.equal(conv_state_ref, conv_state_out)
+    assert torch.allclose(recurrent_state_ref, recurrent_state_out, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
+def test_qwen35_decode_cudac_rejects_duplicate_state_indices():
+    mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, _ = make_inputs(
+        tokens=2,
+        pool_size=3,
+        device=torch.device("cuda"),
+    )
+    state_indices = torch.zeros(2, device=mixed_qkv.device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="requires unique state_indices"):
+        qwen35_linear_attention_decode(
+            mixed_qkv,
+            a,
+            b,
+            conv_weight,
+            A_log,
+            dt_bias,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            state_indices=state_indices,
+            backend="cudac",
+        )

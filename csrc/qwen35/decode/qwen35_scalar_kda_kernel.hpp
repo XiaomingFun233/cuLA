@@ -51,9 +51,10 @@ struct Qwen35ScalarKdaDecodeKernel {
     // - q/k/v are staged once per CTA
     // - proj/out intermediates remain in fp32
     // - recurrent state itself remains in fp32 global storage
-    alignas(16) scalar_t q_smem[kHeadDimQK];
-    alignas(16) scalar_t k_smem[kHeadDimQK];
+    alignas(16) float q_smem[kHeadDimQK];
+    alignas(16) float k_smem[kHeadDimQK];
     alignas(16) scalar_t v_smem[kHeadDimV];
+    alignas(16) float norm_smem[2];
     alignas(16) float proj_smem[kHeadDimV];
     alignas(16) float out_smem[kHeadDimV];
   };

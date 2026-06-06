@@ -392,18 +392,40 @@ struct Qwen35ScalarKdaDecodeMainloop {
     auto q_smem = make_tensor(make_smem_ptr(storage.q_smem), make_layout(make_shape(Int<kHeadDimQK>{})));
     auto k_smem = make_tensor(make_smem_ptr(storage.k_smem), make_layout(make_shape(Int<kHeadDimQK>{})));
     auto v_smem = make_tensor(make_smem_ptr(storage.v_smem), make_layout(make_shape(Int<kHeadDimV>{})));
+    auto norm_smem = make_tensor(make_smem_ptr(storage.norm_smem), make_layout(make_shape(Int<2>{})));
     auto proj_smem = make_tensor(make_smem_ptr(storage.proj_smem), make_layout(make_shape(Int<kHeadDimV>{})));
     auto out_smem = make_tensor(make_smem_ptr(storage.out_smem), make_layout(make_shape(Int<kHeadDimV>{})));
 
     // Stage q/k/v once per CTA for the current decode token.
     for (int idx = tid; idx < kHeadDimQK; idx += num_threads) {
-      q_smem(idx) = q_vec(idx);
-      k_smem(idx) = k_vec(idx);
+      q_smem(idx) = static_cast<float>(q_vec(idx));
+      k_smem(idx) = static_cast<float>(k_vec(idx));
     }
     for (int idx = tid; idx < kHeadDimV; idx += num_threads) {
       v_smem(idx) = v_vec(idx);
       proj_smem(idx) = 0.f;
       out_smem(idx) = 0.f;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float q_norm_sq = 0.f;
+      float k_norm_sq = 0.f;
+#pragma unroll
+      for (int idx = 0; idx < kHeadDimQK; ++idx) {
+        const float q_val = q_smem(idx);
+        const float k_val = k_smem(idx);
+        q_norm_sq += q_val * q_val;
+        k_norm_sq += k_val * k_val;
+      }
+      norm_smem(0) = rsqrtf(q_norm_sq + 1e-6f) * rsqrtf(static_cast<float>(kHeadDimQK));
+      norm_smem(1) = rsqrtf(k_norm_sq + 1e-6f);
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < kHeadDimQK; idx += num_threads) {
+      q_smem(idx) = q_smem(idx) * norm_smem(0);
+      k_smem(idx) = k_smem(idx) * norm_smem(1);
     }
     __syncthreads();
 
@@ -427,7 +449,8 @@ struct Qwen35ScalarKdaDecodeMainloop {
       proj_smem(row_plan.v_row) = proj_row;
 
       const float v_val = static_cast<float>(v_smem(row_plan.v_row));
-      const float v_new_row = beta * (v_val - proj_row);
+      const float decayed_proj_row = decay * proj_row;
+      const float v_new_row = beta * (v_val - decayed_proj_row);
 
       float out_row = 0.f;
       for (int tile_k = 0; tile_k < kTilesPerK; ++tile_k) {

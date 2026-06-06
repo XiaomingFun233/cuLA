@@ -24,6 +24,22 @@ except ImportError:
     cula_cuda = None
 
 
+def _validate_cudac_state_indices(state_indices: torch.Tensor, *, rows: int, pool_size: int) -> None:
+    if state_indices.ndim != 1 or state_indices.numel() != rows:
+        raise ValueError(f"state_indices must be 1D with {rows} entries, got {tuple(state_indices.shape)}")
+    if rows == 0:
+        return
+    min_idx = int(state_indices.min().item())
+    max_idx = int(state_indices.max().item())
+    if min_idx < 0 or max_idx >= pool_size:
+        raise ValueError(f"state_indices must be in [0, {pool_size}), got min={min_idx} max={max_idx}")
+    if torch.unique(state_indices).numel() != rows:
+        raise ValueError(
+            "backend='cudac' requires unique state_indices within one decode launch; "
+            "duplicate rows need a sequential decode path."
+        )
+
+
 def qwen35_scalar_kda_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -71,6 +87,7 @@ def qwen35_scalar_kda_decode(
         raise RuntimeError("Requested backend='cudac' but qwen35_scalar_kda_decode is not available.")
 
     if use_cudac:
+        _validate_cudac_state_indices(state_indices, rows=N, pool_size=recurrent_state.shape[0])
         q_rep = q.squeeze(1).contiguous()
         k_rep = k.squeeze(1).contiguous()
         v_rep = v.squeeze(1).contiguous()

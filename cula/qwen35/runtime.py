@@ -65,7 +65,8 @@ def _torch_qwen35_scalar_kda_decode_reference(
     state_out = recurrent_state.clone()
     out = torch.empty(tokens, num_v_heads, head_v_dim, device=q_rep.device, dtype=q_rep.dtype)
 
-    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1)
+    scale = q_rep.shape[-1] ** -0.5
+    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1) * scale
     k_f = torch.nn.functional.normalize(k_rep.float(), dim=-1)
     v_f = v.float()
     a_f = a_kernel.float()
@@ -84,7 +85,7 @@ def _torch_qwen35_scalar_kda_decode_reference(
             k_vec = k_f[token_idx, hv]
             q_vec = q_f[token_idx, hv]
 
-            proj = state_vk @ k_vec
+            proj = decay * (state_vk @ k_vec)
             v_new = beta * (v_f[token_idx, hv] - proj)
             state_vk_new = decay * state_vk + v_new.unsqueeze(1) * k_vec.unsqueeze(0)
             out[token_idx, hv] = (state_vk_new @ q_vec).to(out.dtype)
