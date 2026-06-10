@@ -21,11 +21,16 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.ops.qwen35_conv1d_decode import qwen35_conv1d_decode_reference, qwen35_conv1d_decode_update
 from cula.ops.qwen35_layout_decode import qwen35_layout_decode, qwen35_layout_decode_reference
 from cula.ops.qwen35_scalar_kda_decode import qwen35_layout_scalar_kda_decode, qwen35_scalar_kda_decode
+from cula.ops.qwen35_conv1d_decode import qwen35_conv1d_decode_reference, qwen35_conv1d_decode_update
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG
 from cula.qwen35.runtime import qwen35_linear_attention_decode
+
+try:
+    from cula.ops.kda_decode_fla import fused_sigmoid_gating_delta_rule_update as triton_fused_sigmoid_update
+except ImportError:
+    triton_fused_sigmoid_update = None
 
 try:
     import cula.cudac as cula_cuda
@@ -133,6 +138,47 @@ def manual_qwen35_decode_reference(
     return out, conv_state_out, state_out
 
 
+def manual_qwen35_layout_scalar_kda_reference(
+    mixed_qkv_conv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+):
+    config = DEFAULT_QWEN35_LINEAR_ATTN_CONFIG
+    q_rep, k_rep, v, a_ref, b_ref = qwen35_layout_decode_reference(mixed_qkv_conv, a, b)
+
+    scale = config.head_k_dim**-0.5
+    q_f = torch.nn.functional.normalize(q_rep.float(), dim=-1) * scale
+    k_f = torch.nn.functional.normalize(k_rep.float(), dim=-1)
+    v_f = v.float()
+    state_out = recurrent_state.clone()
+    out = torch.empty(
+        mixed_qkv_conv.shape[0],
+        q_rep.shape[1],
+        config.head_v_dim,
+        device=mixed_qkv_conv.device,
+        dtype=mixed_qkv_conv.dtype,
+    )
+
+    for token_idx in range(mixed_qkv_conv.shape[0]):
+        pool_idx = int(state_indices[token_idx].item())
+        for hv in range(q_rep.shape[1]):
+            state_kv = state_out[pool_idx, hv]
+            decay = torch.exp(-torch.exp(A_log[hv]) * torch.nn.functional.softplus(a_ref[token_idx, hv].float() + dt_bias[hv]))
+            beta = torch.sigmoid(b_ref[token_idx, hv].float())
+            k_vec = k_f[token_idx, hv]
+            q_vec = q_f[token_idx, hv]
+            proj = decay * (state_kv.transpose(0, 1) @ k_vec)
+            v_new = beta * (v_f[token_idx, hv] - proj)
+            state_new_kv = decay * state_kv + k_vec.unsqueeze(1) * v_new.unsqueeze(0)
+            out[token_idx, hv] = (state_new_kv.transpose(0, 1) @ q_vec).to(mixed_qkv_conv.dtype)
+            state_out[pool_idx, hv] = state_new_kv
+    return out.unsqueeze(1), state_out
+
+
 @pytest.mark.parametrize("tokens", [1, 2])
 def test_qwen35_conv_decode_reference(tokens: int):
     mixed_qkv, _, _, conv_weight, conv_state, _, _, _, _ = make_inputs(tokens=tokens)
@@ -231,7 +277,7 @@ def test_qwen35_decode_cudac_matches_reference(tokens: int):
 
 @pytest.mark.skipif(not _has_qwen35_fused_layout_kda_cudac(), reason="Qwen3.5 fused layout+KDA CUDA backend is not available")
 @pytest.mark.parametrize("tokens", [1, 2, 4])
-def test_qwen35_fused_layout_kda_cudac_matches_unfused(tokens: int):
+def test_qwen35_fused_layout_kda_cudac_matches_reference_unfused_and_triton(tokens: int):
     mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices = make_inputs(
         tokens=tokens,
         pool_size=max(tokens, 3),
@@ -245,6 +291,15 @@ def test_qwen35_fused_layout_kda_cudac_matches_unfused(tokens: int):
         backend="cudac",
     )
     q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode(conv_out, a, b, backend="cudac")
+    out_ref, state_ref = manual_qwen35_layout_scalar_kda_reference(
+        conv_out,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+    )
     out_unfused, state_unfused = qwen35_scalar_kda_decode(
         q=q_rep.unsqueeze(1),
         k=k_rep.unsqueeze(1),
@@ -257,6 +312,25 @@ def test_qwen35_fused_layout_kda_cudac_matches_unfused(tokens: int):
         state_indices=state_indices,
         backend="cudac",
     )
+    if triton_fused_sigmoid_update is not None:
+        state_triton = recurrent_state.clone()
+        out_triton = triton_fused_sigmoid_update(
+            A_log=A_log,
+            a=a_kernel.unsqueeze(1).contiguous(),
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q_rep.unsqueeze(1).contiguous(),
+            k=k_rep.unsqueeze(1).contiguous(),
+            v=v.unsqueeze(1).contiguous(),
+            b=b_kernel.unsqueeze(1).contiguous(),
+            initial_state_source=state_triton,
+            initial_state_indices=state_indices,
+            scale=DEFAULT_QWEN35_LINEAR_ATTN_CONFIG.head_k_dim**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=None,
+            is_kda=False,
+        )
     out_fused, state_fused = qwen35_layout_scalar_kda_decode(
         mixed_qkv_conv=conv_out,
         a=a,
@@ -269,8 +343,13 @@ def test_qwen35_fused_layout_kda_cudac_matches_unfused(tokens: int):
     )
 
     torch.cuda.synchronize()
+    assert torch.allclose(out_ref.float(), out_fused.float(), atol=3e-2, rtol=3e-2)
+    assert torch.allclose(state_ref, state_fused, atol=3e-5, rtol=3e-5)
     assert torch.equal(out_unfused, out_fused)
     assert torch.equal(state_unfused, state_fused)
+    if triton_fused_sigmoid_update is not None:
+        assert torch.allclose(out_triton.float(), out_fused.float(), atol=3e-2, rtol=3e-2)
+        assert torch.allclose(state_triton, state_fused, atol=3e-5, rtol=3e-5)
 
 
 @pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
