@@ -18,6 +18,7 @@
 #include <torch/python.h>
 
 #include "qwen35/decode/qwen35_decode_common.cuh"
+#include "qwen35/prefill/qwen35_prefill_common.cuh"
 
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
@@ -158,6 +159,58 @@ qwen35_layout_scalar_kda_decode(
     cula::qwen35::decode::run_qwen35_layout_scalar_kda_decode(params);
 }
 
+void
+qwen35_scalar_kda_prefill(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    at::Tensor initial_state,
+    at::Tensor cu_seqlens,
+    at::Tensor out,
+    at::Tensor final_state) {
+    cula::qwen35::prefill::ScalarKdaPrefillParams params{
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state,
+        cu_seqlens,
+        out,
+        final_state,
+    };
+    cula::qwen35::prefill::run_qwen35_scalar_kda_prefill(params);
+}
+
+void
+qwen35_layout_prefill(
+    at::Tensor mixed_qkv_conv,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor q_rep,
+    at::Tensor k_rep,
+    at::Tensor v,
+    at::Tensor a_kernel,
+    at::Tensor b_kernel) {
+    cula::qwen35::prefill::LayoutPrefillParams params{
+        mixed_qkv_conv,
+        a,
+        b,
+        q_rep,
+        k_rep,
+        v,
+        a_kernel,
+        b_kernel,
+    };
+    cula::qwen35::prefill::run_qwen35_layout_prefill(params);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
@@ -171,4 +224,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen35_layout_decode", &qwen35_layout_decode);
     m.def("qwen35_scalar_kda_decode", &qwen35_scalar_kda_decode);
     m.def("qwen35_layout_scalar_kda_decode", &qwen35_layout_scalar_kda_decode);
+    m.def("qwen35_layout_prefill", &qwen35_layout_prefill);
+    m.def("qwen35_scalar_kda_prefill", &qwen35_scalar_kda_prefill);
 }

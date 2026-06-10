@@ -32,12 +32,15 @@ from cula.qwen35.common import (
     validate_state_tensors,
 )
 from cula.ops.qwen35_conv1d_decode import qwen35_conv1d_decode_update
+from cula.ops.qwen35_conv1d_prefill import qwen35_conv1d_prefill
 from cula.ops.qwen35_layout_decode import qwen35_layout_decode
+from cula.ops.qwen35_layout_prefill import qwen35_layout_prefill
 from cula.ops.qwen35_scalar_kda_decode import (
     has_qwen35_layout_scalar_kda_decode_cudac,
     qwen35_layout_scalar_kda_decode,
     qwen35_scalar_kda_decode,
 )
+from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill
 
 _stream_cache: dict[tuple[str, int], object] = {}
 
@@ -125,7 +128,7 @@ def qwen35_linear_attention_decode_reference(
         activation="silu",
         backend="reference",
     )
-    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode(
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_prefill(
         conv_out,
         a,
         b,
@@ -158,19 +161,75 @@ def qwen35_linear_attention_prefill(
     cu_seqlens: torch.Tensor | None = None,
     recurrent_state: torch.Tensor | None = None,
     conv_state: torch.Tensor | None = None,
+    backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Qwen3.5 prefill wrapper.
 
-    This is a thin runtime boundary. The underlying CuTe kernels are added in
-    dedicated `cula.ops.qwen35_*` modules.
+    Args:
+        mixed_qkv: flattened [tokens, local_conv_dim]
+        a, b: [tokens, local_num_v_heads]
+        conv_weight: [local_conv_dim, 1, 4] or [local_conv_dim, 4]
+        A_log, dt_bias: [local_num_v_heads]
+        cu_seqlens: optional int32 sequence offsets for flattened input
+        recurrent_state: optional initial recurrent state [num_sequences, HV, 128, 128]
+
+    Returns:
+        - core_attn_out_flat: [tokens, local_value_dim]
+        - final conv_state: [num_sequences, local_conv_dim, 4]
+        - final recurrent_state: [num_sequences, local_num_v_heads, 128, 128]
     """
 
-    del conv_weight, A_log, dt_bias, cu_seqlens
     validate_mixed_qkv(mixed_qkv, config)
     validate_scalar_gate_inputs(a, b, config)
     validate_state_tensors(conv_state, recurrent_state, config)
-    _get_cached_stream(mixed_qkv.device)
-    raise NotImplementedError("Qwen3.5 prefill kernel path is not implemented yet.")
+    if mixed_qkv.is_cuda:
+        _get_cached_stream(mixed_qkv.device)
+    if conv_state is not None:
+        raise NotImplementedError("Qwen3.5 prefill with non-empty conv_state is not implemented yet.")
+    if mixed_qkv.shape[0] != a.shape[0]:
+        raise ValueError(f"Token dimension mismatch, got mixed_qkv={tuple(mixed_qkv.shape)} a={tuple(a.shape)}")
+    if A_log.ndim != 1 or dt_bias.ndim != 1 or A_log.shape != dt_bias.shape:
+        raise ValueError(f"A_log and dt_bias must be matching 1D tensors, got {tuple(A_log.shape)} and {tuple(dt_bias.shape)}")
+    if cu_seqlens is not None and (cu_seqlens.ndim != 1 or cu_seqlens.dtype != torch.int32):
+        raise ValueError(f"cu_seqlens must be 1D int32, got {tuple(cu_seqlens.shape)} {cu_seqlens.dtype}")
+
+    tokens = mixed_qkv.shape[0]
+    local_num_v_heads = a.shape[1]
+    _, local_value_dim, _ = infer_local_config(
+        mixed_qkv.shape[1],
+        local_num_v_heads,
+        config=config,
+    )
+    if A_log.numel() != local_num_v_heads:
+        raise ValueError(f"A_log must match local_num_v_heads={local_num_v_heads}, got {A_log.numel()}")
+
+    conv_out, conv_state_out = qwen35_conv1d_prefill(
+        mixed_qkv,
+        conv_weight,
+        activation="silu",
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_prefill(
+        conv_out,
+        a,
+        b,
+        config=config,
+        backend="reference" if backend == "reference" else "auto",
+    )
+    core_attn_out, recurrent_state_out = qwen35_scalar_kda_prefill(
+        q=q_rep.unsqueeze(0).contiguous(),
+        k=k_rep.unsqueeze(0).contiguous(),
+        v=v.unsqueeze(0).contiguous(),
+        a=a_kernel.unsqueeze(0).contiguous(),
+        b=b_kernel.unsqueeze(0).contiguous(),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=recurrent_state,
+        cu_seqlens=cu_seqlens,
+        backend=backend,
+    )
+    return core_attn_out.reshape(tokens, local_value_dim), conv_state_out, recurrent_state_out
 
 
 def qwen35_linear_attention_decode(

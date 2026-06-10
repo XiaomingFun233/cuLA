@@ -150,6 +150,8 @@ cuda_sources = [
     "csrc/qwen35/decode/qwen35_conv1d_decode.cu",
     "csrc/qwen35/decode/qwen35_layout_decode.cu",
     "csrc/qwen35/decode/qwen35_scalar_kda_decode.cu",
+    "csrc/qwen35/prefill/qwen35_layout_prefill.cu",
+    "csrc/qwen35/prefill/qwen35_scalar_kda_prefill.cu",
 ]
 if not DISABLE_SM100 or not DISABLE_SM103:
     cuda_sources.extend(
