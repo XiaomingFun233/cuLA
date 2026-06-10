@@ -184,6 +184,95 @@ struct Qwen35ScalarKdaDecodeKernel {
         tid,
         kThreads);
   }
+
+  template <typename Mainloop>
+  CUTE_DEVICE static void run_layout_device(
+      const scalar_t* __restrict__ mixed_qkv_conv,
+      const scalar_t* __restrict__ a,
+      const scalar_t* __restrict__ b,
+      const float* __restrict__ A_log,
+      const float* __restrict__ dt_bias,
+      float* __restrict__ recurrent_state,
+      const int32_t* __restrict__ pool_idx,
+      scalar_t* __restrict__ out,
+      int token_count,
+      SharedStorage& storage) {
+    constexpr int kRepeatFactor = kNumVHeads / kNumQKHeads;
+
+    const int hv = static_cast<int>(blockIdx.x);
+    const int token_idx = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (token_idx >= token_count || hv >= kNumVHeads) {
+      return;
+    }
+
+    const int mapped_h = hv / kRepeatFactor;
+
+    auto qk_src_layout = make_layout(
+        make_shape(token_count, Int<kNumQKHeads>{}, Int<kHeadDimQK>{}),
+        make_stride(kMixedQKVDim, kHeadDimQK, Int<1>{}));
+    auto v_src_layout = make_layout(
+        make_shape(token_count, Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+        make_stride(kMixedQKVDim, kHeadDimV, Int<1>{}));
+    auto out_layout = make_layout(
+        make_shape(token_count, Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+        make_stride(kNumVHeads * kHeadDimV, kHeadDimV, Int<1>{}));
+    auto head_layout = make_layout(
+        make_shape(token_count, Int<kNumVHeads>{}),
+        make_stride(kNumVHeads, Int<1>{}));
+    auto hv_layout = make_layout(make_shape(Int<kNumVHeads>{}), make_stride(Int<1>{}));
+    auto state_layout_kv = make_layout(
+        make_shape(_, Int<kNumVHeads>{}, Int<kHeadDimQK>{}, Int<kHeadDimV>{}),
+        make_stride(Int<kNumVHeads>{} * kHeadDimQK * kHeadDimV, kHeadDimQK * kHeadDimV, kHeadDimV, Int<1>{}));
+    auto state_layout_vk = make_layout(
+        make_shape(_, Int<kNumVHeads>{}, Int<kHeadDimV>{}, Int<kHeadDimQK>{}),
+        make_stride(Int<kNumVHeads>{} * kHeadDimQK * kHeadDimV, kHeadDimQK * kHeadDimV, Int<1>{}, kHeadDimV));
+
+    const scalar_t* q_src = mixed_qkv_conv;
+    const scalar_t* k_src = mixed_qkv_conv + kQDim;
+    const scalar_t* v_src = mixed_qkv_conv + kQDim + kKDim;
+
+    auto gQ = make_tensor(make_gmem_ptr(q_src), qk_src_layout);
+    auto gK = make_tensor(make_gmem_ptr(k_src), qk_src_layout);
+    auto gV = make_tensor(make_gmem_ptr(v_src), v_src_layout);
+    auto gO = make_tensor(make_gmem_ptr(out), out_layout);
+    auto gA = make_tensor(make_gmem_ptr(a), head_layout);
+    auto gB = make_tensor(make_gmem_ptr(b), head_layout);
+    auto gAlog = make_tensor(make_gmem_ptr(A_log), hv_layout);
+    auto gDt = make_tensor(make_gmem_ptr(dt_bias), hv_layout);
+    auto gH_kv = make_tensor(make_gmem_ptr(recurrent_state), state_layout_kv);
+    auto gH_vk = make_tensor(make_gmem_ptr(recurrent_state), state_layout_vk);
+    (void)gH_kv;
+
+    const int state_row = pool_idx[token_idx];
+    if (state_row < 0) {
+      return;
+    }
+
+    auto q_vec = gQ(token_idx, mapped_h, _);
+    auto k_vec = gK(token_idx, mapped_h, _);
+    auto v_vec = gV(token_idx, hv, _);
+    auto out_vec = gO(token_idx, hv, _);
+    auto a_scalar = gA(token_idx, hv);
+    auto b_scalar = gB(token_idx, hv);
+    auto A_log_scalar = gAlog(hv);
+    auto dt_bias_scalar = gDt(hv);
+    auto state_vk = gH_vk(state_row, hv, _, _);
+
+    Mainloop::run(
+        q_vec,
+        k_vec,
+        v_vec,
+        a_scalar,
+        b_scalar,
+        A_log_scalar,
+        dt_bias_scalar,
+        state_vk,
+        out_vec,
+        storage,
+        tid,
+        kThreads);
+  }
 };
 
 template <typename scalar_t, typename Mainloop = Qwen35ScalarKdaDecodeMainloop<scalar_t>>
@@ -237,6 +326,57 @@ void launch_qwen35_scalar_kda_decode_kernel(
       v,
       a_kernel,
       b_kernel,
+      A_log,
+      dt_bias,
+      recurrent_state,
+      pool_idx,
+      out,
+      token_count);
+}
+
+template <typename scalar_t, typename Mainloop = Qwen35ScalarKdaDecodeMainloop<scalar_t>>
+__global__ void qwen35_layout_scalar_kda_decode_kernel(
+    const scalar_t* __restrict__ mixed_qkv_conv,
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ recurrent_state,
+    const int32_t* __restrict__ pool_idx,
+    scalar_t* __restrict__ out,
+    int token_count) {
+  __shared__ typename Qwen35ScalarKdaDecodeKernel<scalar_t>::SharedStorage storage;
+  Qwen35ScalarKdaDecodeKernel<scalar_t>::template run_layout_device<Mainloop>(
+      mixed_qkv_conv,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      recurrent_state,
+      pool_idx,
+      out,
+      token_count,
+      storage);
+}
+
+template <typename scalar_t, typename Mainloop = Qwen35ScalarKdaDecodeMainloop<scalar_t>>
+void launch_qwen35_layout_scalar_kda_decode_kernel(
+    cudaStream_t stream,
+    const scalar_t* mixed_qkv_conv,
+    const scalar_t* a,
+    const scalar_t* b,
+    const float* A_log,
+    const float* dt_bias,
+    float* recurrent_state,
+    const int32_t* pool_idx,
+    scalar_t* out,
+    int token_count) {
+  auto grid = Qwen35ScalarKdaDecodeKernel<scalar_t>::grid_shape(token_count);
+  auto block = Qwen35ScalarKdaDecodeKernel<scalar_t>::block_shape();
+  qwen35_layout_scalar_kda_decode_kernel<scalar_t, Mainloop><<<grid, block, 0, stream>>>(
+      mixed_qkv_conv,
+      a,
+      b,
       A_log,
       dt_bias,
       recurrent_state,

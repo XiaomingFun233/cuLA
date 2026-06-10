@@ -135,6 +135,29 @@ qwen35_scalar_kda_decode(
     cula::qwen35::decode::run_qwen35_scalar_kda_decode(params);
 }
 
+void
+qwen35_layout_scalar_kda_decode(
+    at::Tensor mixed_qkv_conv,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    at::Tensor recurrent_state,
+    at::Tensor pool_idx,
+    at::Tensor out) {
+    cula::qwen35::decode::LayoutScalarKdaDecodeParams params{
+        mixed_qkv_conv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        pool_idx,
+        out,
+    };
+    cula::qwen35::decode::run_qwen35_layout_scalar_kda_decode(params);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
@@ -147,4 +170,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen35_conv1d_decode", &qwen35_conv1d_decode);
     m.def("qwen35_layout_decode", &qwen35_layout_decode);
     m.def("qwen35_scalar_kda_decode", &qwen35_scalar_kda_decode);
+    m.def("qwen35_layout_scalar_kda_decode", &qwen35_layout_scalar_kda_decode);
 }

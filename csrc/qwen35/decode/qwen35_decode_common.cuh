@@ -66,8 +66,20 @@ struct ScalarKdaDecodeParams {
   at::Tensor out;              // [N, 48, 128]
 };
 
+struct LayoutScalarKdaDecodeParams {
+  at::Tensor mixed_qkv_conv;    // [N, 10240]
+  at::Tensor a;                 // [N, 48]
+  at::Tensor b;                 // [N, 48]
+  at::Tensor A_log;             // [48], float32
+  at::Tensor dt_bias;           // [48], float32
+  at::Tensor recurrent_state;   // [pool, 48, 128, 128], float32
+  at::Tensor pool_idx;          // [N], int32
+  at::Tensor out;               // [N, 48, 128]
+};
+
 void run_qwen35_conv1d_decode(ConvDecodeParams& params);
 void run_qwen35_layout_decode(LayoutDecodeParams& params);
 void run_qwen35_scalar_kda_decode(ScalarKdaDecodeParams& params);
+void run_qwen35_layout_scalar_kda_decode(LayoutScalarKdaDecodeParams& params);
 
 } // namespace cula::qwen35::decode

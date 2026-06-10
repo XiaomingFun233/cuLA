@@ -24,6 +24,10 @@ except ImportError:
     cula_cuda = None
 
 
+def has_qwen35_layout_scalar_kda_decode_cudac() -> bool:
+    return cula_cuda is not None and hasattr(cula_cuda, "qwen35_layout_scalar_kda_decode")
+
+
 def _validate_cudac_state_indices(state_indices: torch.Tensor, *, rows: int, pool_size: int) -> None:
     if state_indices.ndim != 1 or state_indices.numel() != rows:
         raise ValueError(f"state_indices must be 1D with {rows} entries, got {tuple(state_indices.shape)}")
@@ -131,3 +135,90 @@ def qwen35_scalar_kda_decode(
         state_layout="kv",
     )
     return o, recurrent_state
+
+
+def qwen35_layout_scalar_kda_decode(
+    mixed_qkv_conv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    *,
+    state_indices: torch.Tensor | None = None,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Qwen3.5 layout decode + scalar-gated KDA decode."""
+    if mixed_qkv_conv.ndim != 2:
+        raise ValueError(f"mixed_qkv_conv must be 2D, got {tuple(mixed_qkv_conv.shape)}")
+    if a.ndim == 3:
+        if a.shape[1] != 1:
+            raise ValueError(f"a sequence dim must be 1 for decode, got {tuple(a.shape)}")
+        a = a.squeeze(1)
+    if b.ndim == 3:
+        if b.shape[1] != 1:
+            raise ValueError(f"b sequence dim must be 1 for decode, got {tuple(b.shape)}")
+        b = b.squeeze(1)
+
+    N = mixed_qkv_conv.shape[0]
+    if a.ndim != 2 or b.ndim != 2 or a.shape != b.shape or a.shape[0] != N:
+        raise ValueError(f"a/b must be [N, HV], got a={tuple(a.shape)} b={tuple(b.shape)}")
+    HV = a.shape[1]
+    if A_log.shape != (HV,) or dt_bias.shape != (HV,):
+        raise ValueError(f"A_log/dt_bias must be [HV], got A_log={tuple(A_log.shape)} dt_bias={tuple(dt_bias.shape)}")
+
+    state_indices = (
+        torch.arange(N, device=mixed_qkv_conv.device, dtype=torch.int32)
+        if state_indices is None
+        else state_indices.to(device=mixed_qkv_conv.device, dtype=torch.int32)
+    )
+
+    use_cudac = (
+        backend in ("auto", "cudac")
+        and cula_cuda is not None
+        and hasattr(cula_cuda, "qwen35_layout_scalar_kda_decode")
+        and mixed_qkv_conv.is_cuda
+    )
+    if backend == "cudac" and not use_cudac:
+        raise RuntimeError("Requested backend='cudac' but qwen35_layout_scalar_kda_decode is not available.")
+
+    if use_cudac:
+        _validate_cudac_state_indices(state_indices, rows=N, pool_size=recurrent_state.shape[0])
+        out = torch.empty(
+            N,
+            HV,
+            recurrent_state.shape[-1],
+            device=mixed_qkv_conv.device,
+            dtype=mixed_qkv_conv.dtype,
+        )
+        recurrent_state_out = recurrent_state.clone()
+        cula_cuda.qwen35_layout_scalar_kda_decode(
+            mixed_qkv_conv.contiguous(),
+            a.contiguous(),
+            b.contiguous(),
+            A_log.contiguous(),
+            dt_bias.contiguous(),
+            recurrent_state_out,
+            state_indices,
+            out,
+        )
+        return out.unsqueeze(1), recurrent_state_out
+
+    if backend not in ("auto", "generic_kda"):
+        raise ValueError(f"Unsupported backend={backend}")
+
+    from cula.ops.qwen35_layout_decode import qwen35_layout_decode_reference
+
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode_reference(mixed_qkv_conv, a, b)
+    return qwen35_scalar_kda_decode(
+        q=q_rep.unsqueeze(1).contiguous(),
+        k=k_rep.unsqueeze(1).contiguous(),
+        v=v.unsqueeze(1).contiguous(),
+        a=a_kernel,
+        b=b_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        backend="generic_kda",
+    )

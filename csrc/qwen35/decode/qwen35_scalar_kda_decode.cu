@@ -131,4 +131,95 @@ void run_qwen35_scalar_kda_decode(ScalarKdaDecodeParams& params) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void run_qwen35_layout_scalar_kda_decode(LayoutScalarKdaDecodeParams& params) {
+  const at::Tensor& mixed_qkv_conv = params.mixed_qkv_conv;
+  const at::Tensor& a = params.a;
+  const at::Tensor& b = params.b;
+  const at::Tensor& A_log = params.A_log;
+  const at::Tensor& dt_bias = params.dt_bias;
+  const at::Tensor& recurrent_state = params.recurrent_state;
+  const at::Tensor& pool_idx = params.pool_idx;
+  const at::Tensor& out = params.out;
+
+  TORCH_CHECK(mixed_qkv_conv.is_cuda(), "mixed_qkv_conv must be a CUDA tensor.");
+  const at::Device device = mixed_qkv_conv.device();
+
+  check_tensor_device(a, "a", device);
+  check_tensor_device(b, "b", device);
+  check_tensor_device(A_log, "A_log", device);
+  check_tensor_device(dt_bias, "dt_bias", device);
+  check_tensor_device(recurrent_state, "recurrent_state", device);
+  check_tensor_device(pool_idx, "pool_idx", device);
+  check_tensor_device(out, "out", device);
+
+  TORCH_CHECK(mixed_qkv_conv.is_contiguous(), "mixed_qkv_conv must be contiguous.");
+  TORCH_CHECK(a.is_contiguous(), "a must be contiguous.");
+  TORCH_CHECK(b.is_contiguous(), "b must be contiguous.");
+  TORCH_CHECK(A_log.is_contiguous(), "A_log must be contiguous.");
+  TORCH_CHECK(dt_bias.is_contiguous(), "dt_bias must be contiguous.");
+  TORCH_CHECK(recurrent_state.is_contiguous(), "recurrent_state must be contiguous.");
+  TORCH_CHECK(pool_idx.is_contiguous(), "pool_idx must be contiguous.");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous.");
+
+  TORCH_CHECK(
+      mixed_qkv_conv.scalar_type() == a.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == b.scalar_type() &&
+          mixed_qkv_conv.scalar_type() == out.scalar_type(),
+      "mixed_qkv_conv/a/b/out must share the same dtype.");
+  TORCH_CHECK(
+      mixed_qkv_conv.scalar_type() == at::kHalf || mixed_qkv_conv.scalar_type() == at::kBFloat16,
+      "mixed_qkv_conv must be float16 or bfloat16.");
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat, "A_log must be float32.");
+  TORCH_CHECK(dt_bias.scalar_type() == at::kFloat, "dt_bias must be float32.");
+  TORCH_CHECK(recurrent_state.scalar_type() == at::kFloat, "recurrent_state must be float32.");
+  TORCH_CHECK(pool_idx.scalar_type() == at::kInt, "pool_idx must be int32.");
+
+  const int64_t token_count = mixed_qkv_conv.size(0);
+  TORCH_CHECK(
+      mixed_qkv_conv.dim() == 2 &&
+          mixed_qkv_conv.sizes() == at::IntArrayRef({token_count, kMixedQKVDim}),
+      "mixed_qkv_conv must have shape [N, 10240].");
+  TORCH_CHECK(
+      a.dim() == 2 && a.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
+      "a must have shape [N, 48].");
+  TORCH_CHECK(
+      b.dim() == 2 && b.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
+      "b must have shape [N, 48].");
+  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == kNumVHeads, "A_log must have shape [48].");
+  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == kNumVHeads, "dt_bias must have shape [48].");
+  TORCH_CHECK(
+      recurrent_state.dim() == 4 &&
+          recurrent_state.size(1) == kNumVHeads &&
+          recurrent_state.size(2) == kHeadDimQK &&
+          recurrent_state.size(3) == kHeadDimV,
+      "recurrent_state must have shape [pool, 48, 128, 128].");
+  TORCH_CHECK(pool_idx.dim() == 1 && pool_idx.size(0) == token_count, "pool_idx must have shape [N].");
+  TORCH_CHECK(
+      out.dim() == 3 && out.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimV}),
+      "out must have shape [N, 48, 128].");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
+  cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      mixed_qkv_conv.scalar_type(),
+      "launch_qwen35_layout_scalar_kda_decode_kernel",
+      [&] {
+        kernel::launch_qwen35_layout_scalar_kda_decode_kernel<scalar_t>(
+            stream,
+            mixed_qkv_conv.data_ptr<scalar_t>(),
+            a.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            A_log.data_ptr<float>(),
+            dt_bias.data_ptr<float>(),
+            recurrent_state.data_ptr<float>(),
+            pool_idx.data_ptr<int32_t>(),
+            out.data_ptr<scalar_t>(),
+            static_cast<int>(token_count));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace cula::qwen35::decode

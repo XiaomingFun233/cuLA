@@ -33,7 +33,11 @@ from cula.qwen35.common import (
 )
 from cula.ops.qwen35_conv1d_decode import qwen35_conv1d_decode_update
 from cula.ops.qwen35_layout_decode import qwen35_layout_decode
-from cula.ops.qwen35_scalar_kda_decode import qwen35_scalar_kda_decode
+from cula.ops.qwen35_scalar_kda_decode import (
+    has_qwen35_layout_scalar_kda_decode_cudac,
+    qwen35_layout_scalar_kda_decode,
+    qwen35_scalar_kda_decode,
+)
 
 _stream_cache: dict[tuple[str, int], object] = {}
 
@@ -255,6 +259,28 @@ def qwen35_linear_attention_decode(
         activation="silu",
         backend=backend,
     )
+    use_fused_layout_kda = (
+        backend in ("auto", "cudac")
+        and mixed_qkv.is_cuda
+        and has_qwen35_layout_scalar_kda_decode_cudac()
+    )
+    if backend == "cudac" and not use_fused_layout_kda:
+        raise RuntimeError("Requested backend='cudac' but qwen35_layout_scalar_kda_decode is not available.")
+
+    if use_fused_layout_kda:
+        core_attn_out, recurrent_state_out = qwen35_layout_scalar_kda_decode(
+            mixed_qkv_conv=conv_out,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            state_indices=state_indices,
+            backend=backend,
+        )
+        core_attn_out = core_attn_out.reshape(tokens, local_value_dim)
+        return core_attn_out, conv_state_out, recurrent_state_out
+
     q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode(
         conv_out,
         a,
