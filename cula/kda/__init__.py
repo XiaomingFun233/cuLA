@@ -13,9 +13,19 @@
 # limitations under the License.
 
 from cula.kda.blackwell_fused_fwd import flash_kda_prefill as kda_prefill_blackwell
-from cula.kda.chunk import chunk_kda
-from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
-from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+try:
+    from cula.kda.chunk import chunk_kda
+except Exception:  # pragma: no cover - optional FLA dependency
+    chunk_kda = None
+try:
+    from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
+except Exception:  # pragma: no cover - optional FLA/Hopper dependency
+    kda_prefill_hopper = None
+try:
+    from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+except Exception:  # pragma: no cover - optional CUDA/CuTe dependency
+    fused_sigmoid_gating_delta_rule_update = None
+    kda_decode = None
 
 __all__ = [
     "chunk_kda",

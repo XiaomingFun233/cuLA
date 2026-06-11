@@ -17,13 +17,18 @@
 
 Reports:
   - layout: cuLA Qwen3.5 prefill layout split/repeat kernel
-  - scalar_kda: cuLA Qwen3.5 scalar-gated KDA prefill kernel
+  - cula_qk: cuLA Qwen3.5 TMA/WGMMA-or-UMMA QK chunk debug kernel
+  - cula_fused: cuLA generic fused KDA core through a Qwen3.5 scalar-gate adapter
   - fla_gdr: optional FLA chunk_gated_delta_rule baseline
   - sgl_gdr: optional SGLang vendored Triton chunk_gated_delta_rule baseline
 
 Baselines are optional. SGLang Qwen3.5 prefill uses the same chunked gated
 delta rule family in its Triton GDN kernel; decode uses a recurrent packed
 kernel instead.
+
+Note: cula_qk currently benchmarks the TMA tensor-core Q @ K^T subpath only,
+not the full gated-delta prefill recurrence. Its output is [B,48,T,T], so long
+sequence lengths have quadratic memory cost.
 """
 
 from __future__ import annotations
@@ -37,13 +42,23 @@ import sys
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from cula.ops.qwen35_layout_prefill import qwen35_layout_prefill
+from cula.ops.qwen35_fused_kda_prefill import qwen35_fused_kda_prefill
 from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG as CONFIG
+from cula.utils import get_kda_fused_fwd
+
+try:
+    import cula.cudac as cula_cuda
+except ImportError:
+    cula_cuda = None
+
+RCP_LN2 = 1.4426950408889634
 
 
 def benchmark_cuda_fn(fn: Callable[[], object], *, warmup: int, rep: int) -> float:
@@ -129,6 +144,13 @@ def make_inputs(batch: int, seq_len: int, *, device: torch.device, seed: int):
     return q, k, v, a, b, beta, log_gate, A_log, dt_bias, initial_state, mixed_qkv_conv, a_flat, b_flat
 
 
+def run_cula_chunk_qk(q, k, out):
+    if cula_cuda is None or not hasattr(cula_cuda, "qwen35_chunk_qk_prefill_sm90"):
+        raise RuntimeError("cula.cudac.qwen35_chunk_qk_prefill_sm90 is not available. Rebuild the CUDA extension.")
+    cula_cuda.qwen35_chunk_qk_prefill_sm90(q.contiguous(), k.contiguous(), out)
+    return out
+
+
 def run_cula_scalar(q, k, v, a, b, A_log, dt_bias, initial_state):
     return qwen35_scalar_kda_prefill(
         q,
@@ -140,6 +162,54 @@ def run_cula_scalar(q, k, v, a, b, A_log, dt_bias, initial_state):
         dt_bias,
         initial_state=initial_state,
         backend="cudac",
+    )
+
+
+def run_cula_fused(q, k, v, a, b, A_log, dt_bias, initial_state):
+    return qwen35_fused_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+    )
+
+
+def prepare_cula_fused_core_inputs(q, k, a, b, A_log, dt_bias, initial_state):
+    B, T, HV, K = q.shape
+    q_norm = F.normalize(q.float(), dim=-1).to(q.dtype).contiguous()
+    k_norm = F.normalize(k.float(), dim=-1).to(k.dtype).contiguous()
+    log_gate_scalar = -torch.exp(A_log.float()).view(1, 1, HV, 1) * F.softplus(
+        a.float().unsqueeze(-1) + dt_bias.float().view(1, 1, HV, 1)
+    )
+    log_gate = log_gate_scalar.expand(B, T, HV, K).contiguous()
+    chunks = []
+    for chunk_start in range(0, T, 64):
+        chunks.append(log_gate[:, chunk_start : chunk_start + 64].cumsum(dim=1) * RCP_LN2)
+    log_gate_cumsum = torch.cat(chunks, dim=1).contiguous()
+    beta = torch.sigmoid(b.float()).contiguous()
+    initial_state_vk = initial_state.float().transpose(-1, -2).contiguous()
+    return q_norm, k_norm, log_gate_cumsum, beta, initial_state_vk
+
+
+def run_cula_fused_core(q_norm, k_norm, v, log_gate_cumsum, beta, initial_state_vk):
+    fused_kda_prefill = get_kda_fused_fwd(q_norm.device)
+    return fused_kda_prefill(
+        q=q_norm,
+        k=k_norm,
+        v=v.contiguous(),
+        g=log_gate_cumsum,
+        beta=beta,
+        scale=CONFIG.head_k_dim**-0.5,
+        initial_state=initial_state_vk,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=False,
+        safe_gate=False,
+        g_is_cumsum=True,
     )
 
 
@@ -190,12 +260,21 @@ def print_header(device: torch.device, args: argparse.Namespace, baseline_source
     print(f"  seq lens: {args.seq_lens}")
     print(f"  warmup/rep: {args.warmup}/{args.rep}")
     print(f"  baselines: {baseline_sources or 'disabled/unavailable'}")
+    if args.cula_mode == "qk":
+        print("  cula: qwen35_chunk_qk_prefill_sm90 QK subpath only; baselines are full Triton GDR chunk kernels")
+    elif args.cula_mode == "scalar":
+        print("  cula: qwen35_scalar_kda_prefill full recurrence fallback")
+    elif args.cula_mode == "fused":
+        print("  cula: qwen35_fused_kda_prefill full recurrence via fused KDA CuTe core")
+    elif args.cula_mode == "fused-core":
+        print("  cula: fused KDA CuTe core only; Qwen gate/l2norm/cumsum/state prep is outside timing")
     print()
+    cula_col = f"cula_{args.cula_mode}_ms"
     print(
-        f"{'baseline':>8} {'B':>3} {'T':>7} {'layout_ms':>11} {'cula_kda_ms':>12} {'cula_total':>11} "
-        f"{'base_ms':>11} {'speedup':>9} {'rel_rms':>10} {'rel_max':>10}"
+        f"{'baseline':>8} {'B':>3} {'T':>7} {'layout_ms':>11} {cula_col:>13} {'cula_total':>11} "
+        f"{'base_ms':>11} {'base/cula':>10} {'rel_rms':>11} {'rel_max':>11}"
     )
-    print("-" * 108)
+    print("-" * 113)
 
 
 def main() -> None:
@@ -207,7 +286,19 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--baseline", choices=["none", "fla", "sgl", "all"], default="sgl")
     parser.add_argument("--sglang-path", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--cula-mode",
+        choices=["qk", "scalar", "fused", "fused-core"],
+        default="qk",
+        help="cuLA path to benchmark: qk is QK subpath, scalar is old full fallback, fused is wrapper, fused-core is kernel only.",
+    )
     parser.add_argument("--skip-accuracy", action="store_true")
+    parser.add_argument(
+        "--max-qk-elements",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="Skip cuLA QK timings when B*48*T*T exceeds this element count.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -245,44 +336,88 @@ def main() -> None:
         def layout_fn():
             return qwen35_layout_prefill(mixed_qkv_conv, a_flat, b_flat, backend="cudac")
 
-        def cula_kda_fn():
-            return run_cula_scalar(q, k, v, a, b, A_log, dt_bias, initial_state)
+        qk_elements = args.batch * CONFIG.num_v_heads * seq_len * seq_len
+        qk_out = None
+        if args.cula_mode == "qk" and qk_elements <= args.max_qk_elements:
+            qk_out = torch.empty(
+                args.batch,
+                CONFIG.num_v_heads,
+                seq_len,
+                seq_len,
+                device=device,
+                dtype=torch.float32,
+            )
+        fused_core_inputs = None
+        if args.cula_mode == "fused-core":
+            fused_core_inputs = prepare_cula_fused_core_inputs(q, k, a, b, A_log, dt_bias, initial_state)
+
+        def cula_fn():
+            if args.cula_mode == "scalar":
+                return run_cula_scalar(q, k, v, a, b, A_log, dt_bias, initial_state)
+            if args.cula_mode == "fused":
+                return run_cula_fused(q, k, v, a, b, A_log, dt_bias, initial_state)
+            if args.cula_mode == "fused-core":
+                return run_cula_fused_core(*fused_core_inputs[:2], v, *fused_core_inputs[2:])
+            if qk_out is None:
+                raise RuntimeError(
+                    f"Skipping cuLA QK: B*H*T*T={qk_elements} exceeds --max-qk-elements={args.max_qk_elements}"
+                )
+            return run_cula_chunk_qk(q, k, qk_out)
 
         layout_ms = benchmark_cuda_fn(layout_fn, warmup=args.warmup, rep=args.rep)
-        cula_kda_ms = benchmark_cuda_fn(cula_kda_fn, warmup=args.warmup, rep=args.rep)
-        cula_total_ms = layout_ms + cula_kda_ms
+        cula_ms = (
+            float("nan")
+            if args.cula_mode == "qk" and qk_out is None
+            else benchmark_cuda_fn(cula_fn, warmup=args.warmup, rep=args.rep)
+        )
+        cula_total_ms = layout_ms + cula_ms if not torch.isnan(torch.tensor(cula_ms)) else float("nan")
+
+        rel_rms = float("nan")
+        rel_max = float("nan")
+        state_cula = None
+        if not args.skip_accuracy:
+            out_cula = cula_fn()
+            if args.cula_mode == "qk":
+                qk_ref = torch.einsum("bthd,bshd->bhts", q.float(), k.float())
+                torch.cuda.synchronize()
+                rel_rms, rel_max, _ = error_stats(qk_ref, out_cula)
+                del qk_ref
+            else:
+                out_cula, state_cula = out_cula
+            torch.cuda.synchronize()
 
         if not baselines:
             print(
-                f"{'none':>8} {args.batch:3d} {seq_len:7d} {layout_ms:11.4f} {cula_kda_ms:12.4f} {cula_total_ms:11.4f} "
-                f"{float('nan'):11.4f} {float('nan'):9.3f} {float('nan'):10.3e} {float('nan'):10.3e}"
+                f"{'none':>8} {args.batch:3d} {seq_len:7d} {layout_ms:11.4f} {cula_ms:13.4f} {cula_total_ms:11.4f} "
+                f"{float('nan'):11.4f} {float('nan'):10.3f} {rel_rms:11.3e} {rel_max:11.3e}"
             )
 
         for baseline_name, chunk_gdr in baselines.items():
             def baseline_fn():
                 return run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_state_indices)
 
-            rel_rms = float("nan")
-            rel_max = float("nan")
-            if not args.skip_accuracy:
-                out_cula, state_cula = cula_kda_fn()
+            row_rel_rms = rel_rms
+            row_rel_max = rel_max
+            if args.cula_mode in ("scalar", "fused", "fused-core") and not args.skip_accuracy:
+                if state_cula is None:
+                    out_cula, state_cula = cula_fn()
                 out_base, state_base = _normalize_chunk_result(baseline_fn())
                 state_base = _state_to_cula_layout(state_base)
                 torch.cuda.synchronize()
-                rel_rms, rel_max, _ = error_stats(out_base, out_cula)
+                row_rel_rms, row_rel_max, _ = error_stats(out_base, out_cula)
                 if state_base is not None and tuple(state_base.shape) == tuple(state_cula.shape):
                     rel_rms_s, rel_max_s, _ = error_stats(state_base, state_cula)
-                    rel_rms = max(rel_rms, rel_rms_s)
-                    rel_max = max(rel_max, rel_max_s)
+                    row_rel_rms = max(row_rel_rms, rel_rms_s)
+                    row_rel_max = max(row_rel_max, rel_max_s)
 
             base_ms = benchmark_cuda_fn(baseline_fn, warmup=args.warmup, rep=args.rep)
-            speedup = base_ms / cula_kda_ms if cula_kda_ms > 0 else float("inf")
+            speedup = base_ms / cula_ms if cula_ms > 0 else float("nan")
             print(
-                f"{baseline_name:>8} {args.batch:3d} {seq_len:7d} {layout_ms:11.4f} {cula_kda_ms:12.4f} {cula_total_ms:11.4f} "
-                f"{base_ms:11.4f} {speedup:9.3f} {rel_rms:10.3e} {rel_max:10.3e}"
+                f"{baseline_name:>8} {args.batch:3d} {seq_len:7d} {layout_ms:11.4f} {cula_ms:13.4f} {cula_total_ms:11.4f} "
+                f"{base_ms:11.4f} {speedup:10.3f} {row_rel_rms:11.3e} {row_rel_max:11.3e}"
             )
 
-        del q, k, v, a, b, beta, log_gate, A_log, dt_bias, initial_state, initial_state_indices, mixed_qkv_conv, a_flat, b_flat
+        del q, k, v, a, b, beta, log_gate, A_log, dt_bias, initial_state, initial_state_indices, mixed_qkv_conv, a_flat, b_flat, qk_out, fused_core_inputs
         torch.cuda.empty_cache()
 
 

@@ -68,7 +68,12 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
-from fla.modules.l2norm import l2norm_fwd
+try:
+    from fla.modules.l2norm import l2norm_fwd
+except ImportError:
+    def l2norm_fwd(x: torch.Tensor):
+        rstd = torch.rsqrt(x.float().square().sum(dim=-1, keepdim=True).clamp_min(1.0e-12))
+        return (x.float() * rstd).to(x.dtype), rstd
 
 from cula.utils import assert_blackwell
 
@@ -2993,13 +2998,16 @@ class KDAChunkwise:
                     # ------------------------------------------------------------
                     # NOTE: Save exp(g) of last VALID row to rG_last for state update in next chunk
                     # For full chunks, directly use C-1; only loop for partial chunks (varlen only)
+                    rG_last = cutlass.Float32(1.0)
                     if cutlass.const_expr(self.is_varlen):
                         if valid_len_chunk < C:
-                            rG_last = exp_g[valid_len_chunk - 1]
+                            for _zr in cutlass.range(0, Constant.C, unroll_full=True):
+                                if _zr == valid_len_chunk - 1:
+                                    rG_last = cute.exp2(tRS_rG[0, _zr, 0], fastmath=self.use_fast_math)
                         else:
-                            rG_last = exp_g[Constant.C - 1]
+                            rG_last = cute.exp2(tRS_rG[0, Constant.C - 1, 0], fastmath=self.use_fast_math)
                     else:
-                        rG_last = exp_g[Constant.C - 1]
+                        rG_last = cute.exp2(tRS_rG[0, Constant.C - 1, 0], fastmath=self.use_fast_math)
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 

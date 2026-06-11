@@ -21,10 +21,16 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.ops.qwen35_conv1d_prefill import qwen35_conv1d_prefill
+from cula.ops.qwen35_fused_kda_prefill import has_qwen35_fused_kda_prefill, qwen35_fused_kda_prefill
 from cula.ops.qwen35_layout_prefill import qwen35_layout_prefill, qwen35_layout_prefill_reference
 from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill
 from cula.qwen35.common import Qwen35LinearAttentionConfig
 from cula.qwen35.runtime import qwen35_linear_attention_prefill
+
+try:
+    import cula.cudac as cula_cuda
+except ImportError:
+    cula_cuda = None
 
 
 def _manual_scalar_prefill(q, k, v, a, b, A_log, dt_bias, initial_state=None, cu_seqlens=None):
@@ -116,6 +122,121 @@ def test_qwen35_scalar_kda_prefill_varlen_reference_matches_manual():
 
     torch.testing.assert_close(out.float(), out_ref.float(), atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(state, state_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_qwen35_scalar_kda_prefill_cuda_matches_reference():
+    if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_scalar_kda_prefill"):
+        import pytest
+
+        pytest.skip("qwen35_scalar_kda_prefill CUDA extension is not available")
+
+    torch.manual_seed(10)
+    device = torch.device("cuda")
+    B, T, HV, K = 1, 8, 48, 128
+    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    A_log = -torch.rand(HV, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    initial_state = torch.randn(B, HV, K, K, device=device, dtype=torch.float32) * 0.01
+
+    out_ref, state_ref = qwen35_scalar_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+        backend="reference",
+    )
+    out, state = qwen35_scalar_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(state, state_ref, atol=2e-2, rtol=2e-2)
+
+
+def test_qwen35_chunk_qk_prefill_sm90_matches_torch():
+    if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_chunk_qk_prefill_sm90"):
+        import pytest
+
+        pytest.skip("qwen35_chunk_qk_prefill_sm90 CUDA extension is not available")
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    B, T, HV, K = 1, 64, 48, 128
+    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    out = torch.empty(B, HV, T, T, device=device, dtype=torch.float32)
+
+    cula_cuda.qwen35_chunk_qk_prefill_sm90(q.contiguous(), k.contiguous(), out)
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bthd,bshd->bhts", q.float(), k.float())
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+
+
+def test_qwen35_fused_kda_prefill_matches_reference():
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("CUDA is not available")
+    if not has_qwen35_fused_kda_prefill(torch.device("cuda")):
+        import pytest
+
+        pytest.skip("Qwen3.5 fused KDA prefill backend is not available")
+
+    torch.manual_seed(12)
+    device = torch.device("cuda")
+    B, T, HV, K = 1, 64, 48, 128
+    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    A_log = -torch.rand(HV, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    initial_state = torch.randn(B, HV, K, K, device=device, dtype=torch.float32) * 0.01
+
+    out_ref, state_ref = qwen35_scalar_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+        backend="reference",
+    )
+    out, state = qwen35_fused_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(state, state_ref, atol=3e-2, rtol=3e-2)
 
 
 def test_qwen35_conv1d_prefill_flattened_state():

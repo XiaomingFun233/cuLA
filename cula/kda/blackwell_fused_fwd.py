@@ -17,6 +17,7 @@ import sys
 import warnings
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
@@ -24,13 +25,58 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from fla.modules.l2norm import l2norm_fwd
 
 # from fla.ops.kda.chunk_inter import chunk_kda_bwd_dqkwg
-from fla.ops.kda.gate import kda_gate_fwd
-from fla.ops.utils import chunk_local_cumsum
-from fla.ops.utils.constant import RCP_LN2
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+try:
+    from fla.modules.l2norm import l2norm_fwd
+    from fla.ops.kda.gate import kda_gate_fwd
+    from fla.ops.utils import chunk_local_cumsum
+    from fla.ops.utils.constant import RCP_LN2
+    from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+except ImportError:
+    RCP_LN2 = 1.4426950408889634
+
+    def input_guard(fn):
+        return fn
+
+    def autocast_custom_fwd(fn):
+        return fn
+
+    def autocast_custom_bwd(fn):
+        return fn
+
+    def l2norm_fwd(x: torch.Tensor):
+        rstd = torch.rsqrt(x.float().square().sum(dim=-1, keepdim=True).clamp_min(1.0e-12))
+        return (x.float() * rstd).to(x.dtype), rstd
+
+    def kda_gate_fwd(*args, **kwargs):
+        raise ImportError("fla is required for use_gate_in_kernel=True in blackwell_fused_fwd")
+
+    def chunk_local_cumsum(
+        g: torch.Tensor,
+        chunk_size: int,
+        scale: float = 1.0,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if chunk_indices is not None:
+            raise ImportError("fla is required for chunk_indices support in blackwell_fused_fwd")
+        if cu_seqlens is not None:
+            if g.shape[0] != 1:
+                raise ValueError("cu_seqlens mode expects flattened g with batch size 1")
+            out = torch.empty_like(g.float())
+            for seq_idx in range(cu_seqlens.numel() - 1):
+                start = int(cu_seqlens[seq_idx].item())
+                end = int(cu_seqlens[seq_idx + 1].item())
+                for chunk_start in range(start, end, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, end)
+                    out[:, chunk_start:chunk_end] = g[:, chunk_start:chunk_end].float().cumsum(dim=1) * scale
+            return out
+        chunks = []
+        for chunk_start in range(0, g.shape[1], chunk_size):
+            chunk = g[:, chunk_start : chunk_start + chunk_size].float().cumsum(dim=1) * scale
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1).contiguous()
 
 from cula.ops.kda_fully_fused_sm100_wip import KDAChunkwise
 from cula.utils import USE_FAST_MATH, assert_blackwell
@@ -64,6 +110,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
+        g_is_cumsum: bool = False,
         cu_seqlens: torch.IntTensor | None = None,
         chunk_indices: torch.IntTensor | None = None,
     ):
@@ -106,7 +153,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                     A_log=A_log,
                     dt_bias=dt_bias,
                 )
-        if not (safe_gate and use_gate_in_kernel):
+        if not g_is_cumsum and not (safe_gate and use_gate_in_kernel):
             g = chunk_local_cumsum(
                 g=g, chunk_size=chunk_size, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
             )
@@ -267,6 +314,7 @@ def flash_kda_prefill(
     use_gate_in_kernel: bool = False,
     safe_gate: bool = False,
     lower_bound: float | None = None,
+    g_is_cumsum: bool = False,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
     **kwargs,
@@ -326,6 +374,7 @@ def flash_kda_prefill(
         use_gate_in_kernel,
         safe_gate,
         lower_bound,
+        g_is_cumsum,
         cu_seqlens,
         chunk_indices,
     )

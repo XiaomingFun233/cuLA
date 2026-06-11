@@ -94,11 +94,11 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        from cula.kda import kda_prefill_blackwell
+        from cula.kda.blackwell_fused_fwd import flash_kda_prefill as kda_prefill_blackwell
 
         return kda_prefill_blackwell
     elif major == 9 and minor == 0:
-        from cula.kda import kda_prefill_hopper
+        from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
 
         return kda_prefill_hopper
     else:

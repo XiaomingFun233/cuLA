@@ -211,6 +211,11 @@ qwen35_layout_prefill(
     cula::qwen35::prefill::run_qwen35_layout_prefill(params);
 }
 
+void
+qwen35_chunk_qk_prefill_sm90(at::Tensor q, at::Tensor k, at::Tensor out) {
+    cula::qwen35::prefill::sm90::qwen35_chunk_qk_prefill_sm90(q, k, out);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
@@ -226,4 +231,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen35_layout_scalar_kda_decode", &qwen35_layout_scalar_kda_decode);
     m.def("qwen35_layout_prefill", &qwen35_layout_prefill);
     m.def("qwen35_scalar_kda_prefill", &qwen35_scalar_kda_prefill);
+    m.def("qwen35_chunk_qk_prefill_sm90", &qwen35_chunk_qk_prefill_sm90);
 }

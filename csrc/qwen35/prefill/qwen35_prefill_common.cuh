@@ -58,3 +58,9 @@ void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params);
 void run_qwen35_layout_prefill(LayoutPrefillParams& params);
 
 } // namespace cula::qwen35::prefill
+
+namespace cula::qwen35::prefill::sm90 {
+
+void qwen35_chunk_qk_prefill_sm90(at::Tensor q, at::Tensor k, at::Tensor out);
+
+} // namespace cula::qwen35::prefill::sm90

@@ -27,7 +27,11 @@ template <typename scalar_t>
 struct Qwen35ScalarKdaPrefillKernel {
   static constexpr int kThreads = 128;
   static constexpr int kHeadDim = kHeadDimQK;
-  static constexpr int kVTile = 8;
+  // Keep the scalar CUDA fallback at one V row per CTA for correctness while
+  // the SM90 chunk/TMA path is being wired in.  The previous multi-row V tile
+  // version exposed a correctness bug with non-zero initial_state; the chunk
+  // path should own the next parallelization step.
+  static constexpr int kVTile = 1;
   static constexpr int kNumVTiles = kHeadDimV / kVTile;
 
   static_assert(kHeadDimQK == 128);
