@@ -28,6 +28,62 @@ void check_tensor_device(const at::Tensor& tensor, const char* name, const at::D
   TORCH_CHECK(tensor.device() == device, name, " must be on device ", device, ".");
 }
 
+template <typename scalar_t, int kLocalVHeads>
+void dispatch_scalar_decode_for_heads(
+    cudaStream_t stream,
+    const scalar_t* q_rep,
+    const scalar_t* k_rep,
+    const scalar_t* v,
+    const scalar_t* a_kernel,
+    const scalar_t* b_kernel,
+    const float* A_log,
+    const float* dt_bias,
+    float* recurrent_state,
+    const int32_t* pool_idx,
+    scalar_t* out,
+    int token_count) {
+  constexpr int kLocalQKHeads = local_qk_heads_from_v_heads(kLocalVHeads);
+  kernel::launch_qwen35_scalar_kda_decode_kernel<scalar_t, kLocalQKHeads, kLocalVHeads>(
+      stream,
+      q_rep,
+      k_rep,
+      v,
+      a_kernel,
+      b_kernel,
+      A_log,
+      dt_bias,
+      recurrent_state,
+      pool_idx,
+      out,
+      token_count);
+}
+
+template <typename scalar_t, int kLocalVHeads>
+void dispatch_layout_scalar_decode_for_heads(
+    cudaStream_t stream,
+    const scalar_t* mixed_qkv_conv,
+    const scalar_t* a,
+    const scalar_t* b,
+    const float* A_log,
+    const float* dt_bias,
+    float* recurrent_state,
+    const int32_t* pool_idx,
+    scalar_t* out,
+    int token_count) {
+  constexpr int kLocalQKHeads = local_qk_heads_from_v_heads(kLocalVHeads);
+  kernel::launch_qwen35_layout_scalar_kda_decode_kernel<scalar_t, kLocalQKHeads, kLocalVHeads>(
+      stream,
+      mixed_qkv_conv,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      recurrent_state,
+      pool_idx,
+      out,
+      token_count);
+}
+
 } // namespace
 
 void run_qwen35_scalar_kda_decode(ScalarKdaDecodeParams& params) {
@@ -76,34 +132,37 @@ void run_qwen35_scalar_kda_decode(ScalarKdaDecodeParams& params) {
   TORCH_CHECK(recurrent_state.scalar_type() == at::kFloat, "recurrent_state must be float32.");
   TORCH_CHECK(pool_idx.scalar_type() == at::kInt, "pool_idx must be int32.");
 
+  TORCH_CHECK(q_rep.dim() == 3, "q_rep must have shape [N, local_v_heads, 128].");
   const int64_t token_count = q_rep.size(0);
+  const int64_t local_v_heads = q_rep.size(1);
+  TORCH_CHECK(is_supported_local_v_heads(static_cast<int>(local_v_heads)), "local V heads must be one of {48, 24, 12, 6}, got ", local_v_heads, ".");
   TORCH_CHECK(
-      q_rep.dim() == 3 && q_rep.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimQK}),
-      "q_rep must have shape [N, 48, 128].");
+      q_rep.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimQK}),
+      "q_rep must have shape [N, local_v_heads, 128].");
   TORCH_CHECK(
-      k_rep.dim() == 3 && k_rep.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimQK}),
-      "k_rep must have shape [N, 48, 128].");
+      k_rep.dim() == 3 && k_rep.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimQK}),
+      "k_rep must have shape [N, local_v_heads, 128].");
   TORCH_CHECK(
-      v.dim() == 3 && v.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimV}),
-      "v must have shape [N, 48, 128].");
+      v.dim() == 3 && v.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimV}),
+      "v must have shape [N, local_v_heads, 128].");
   TORCH_CHECK(
-      a_kernel.dim() == 2 && a_kernel.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
-      "a_kernel must have shape [N, 48].");
+      a_kernel.dim() == 2 && a_kernel.sizes() == at::IntArrayRef({token_count, local_v_heads}),
+      "a_kernel must have shape [N, local_v_heads].");
   TORCH_CHECK(
-      b_kernel.dim() == 2 && b_kernel.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
-      "b_kernel must have shape [N, 48].");
-  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == kNumVHeads, "A_log must have shape [48].");
-  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == kNumVHeads, "dt_bias must have shape [48].");
+      b_kernel.dim() == 2 && b_kernel.sizes() == at::IntArrayRef({token_count, local_v_heads}),
+      "b_kernel must have shape [N, local_v_heads].");
+  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == local_v_heads, "A_log must have shape [local_v_heads].");
+  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == local_v_heads, "dt_bias must have shape [local_v_heads].");
   TORCH_CHECK(
       recurrent_state.dim() == 4 &&
-          recurrent_state.size(1) == kNumVHeads &&
+          recurrent_state.size(1) == local_v_heads &&
           recurrent_state.size(2) == kHeadDimQK &&
           recurrent_state.size(3) == kHeadDimV,
-      "recurrent_state must have shape [pool, 48, 128, 128].");
+      "recurrent_state must have shape [pool, local_v_heads, 128, 128].");
   TORCH_CHECK(pool_idx.dim() == 1 && pool_idx.size(0) == token_count, "pool_idx must have shape [N].");
   TORCH_CHECK(
-      out.dim() == 3 && out.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimV}),
-      "out must have shape [N, 48, 128].");
+      out.dim() == 3 && out.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimV}),
+      "out must have shape [N, local_v_heads, 128].");
 
   const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
@@ -114,19 +173,20 @@ void run_qwen35_scalar_kda_decode(ScalarKdaDecodeParams& params) {
       q_rep.scalar_type(),
       "launch_qwen35_scalar_kda_decode_kernel",
       [&] {
-        kernel::launch_qwen35_scalar_kda_decode_kernel<scalar_t>(
-            stream,
-            q_rep.data_ptr<scalar_t>(),
-            k_rep.data_ptr<scalar_t>(),
-            v.data_ptr<scalar_t>(),
-            a_kernel.data_ptr<scalar_t>(),
-            b_kernel.data_ptr<scalar_t>(),
-            A_log.data_ptr<float>(),
-            dt_bias.data_ptr<float>(),
-            recurrent_state.data_ptr<float>(),
-            pool_idx.data_ptr<int32_t>(),
-            out.data_ptr<scalar_t>(),
-            static_cast<int>(token_count));
+        switch (local_v_heads) {
+          case 48:
+            dispatch_scalar_decode_for_heads<scalar_t, 48>(stream, q_rep.data_ptr<scalar_t>(), k_rep.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), a_kernel.data_ptr<scalar_t>(), b_kernel.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 24:
+            dispatch_scalar_decode_for_heads<scalar_t, 24>(stream, q_rep.data_ptr<scalar_t>(), k_rep.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), a_kernel.data_ptr<scalar_t>(), b_kernel.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 12:
+            dispatch_scalar_decode_for_heads<scalar_t, 12>(stream, q_rep.data_ptr<scalar_t>(), k_rep.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), a_kernel.data_ptr<scalar_t>(), b_kernel.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 6:
+            dispatch_scalar_decode_for_heads<scalar_t, 6>(stream, q_rep.data_ptr<scalar_t>(), k_rep.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), a_kernel.data_ptr<scalar_t>(), b_kernel.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -174,29 +234,34 @@ void run_qwen35_layout_scalar_kda_decode(LayoutScalarKdaDecodeParams& params) {
   TORCH_CHECK(recurrent_state.scalar_type() == at::kFloat, "recurrent_state must be float32.");
   TORCH_CHECK(pool_idx.scalar_type() == at::kInt, "pool_idx must be int32.");
 
+  TORCH_CHECK(mixed_qkv_conv.dim() == 2, "mixed_qkv_conv must have shape [N, local_conv_dim].");
+  TORCH_CHECK(a.dim() == 2, "a must have shape [N, local_v_heads].");
   const int64_t token_count = mixed_qkv_conv.size(0);
+  const int64_t local_v_heads = a.size(1);
+  TORCH_CHECK(is_supported_local_v_heads(static_cast<int>(local_v_heads)), "local V heads must be one of {48, 24, 12, 6}, got ", local_v_heads, ".");
+  const int local_qk_heads = local_qk_heads_from_v_heads(static_cast<int>(local_v_heads));
+  const int local_mixed_dim = local_mixed_qkv_dim(local_qk_heads, static_cast<int>(local_v_heads));
   TORCH_CHECK(
-      mixed_qkv_conv.dim() == 2 &&
-          mixed_qkv_conv.sizes() == at::IntArrayRef({token_count, kMixedQKVDim}),
-      "mixed_qkv_conv must have shape [N, 10240].");
+      mixed_qkv_conv.sizes() == at::IntArrayRef({token_count, local_mixed_dim}),
+      "mixed_qkv_conv must have shape [N, local_conv_dim].");
   TORCH_CHECK(
-      a.dim() == 2 && a.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
-      "a must have shape [N, 48].");
+      a.sizes() == at::IntArrayRef({token_count, local_v_heads}),
+      "a must have shape [N, local_v_heads].");
   TORCH_CHECK(
-      b.dim() == 2 && b.sizes() == at::IntArrayRef({token_count, kNumVHeads}),
-      "b must have shape [N, 48].");
-  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == kNumVHeads, "A_log must have shape [48].");
-  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == kNumVHeads, "dt_bias must have shape [48].");
+      b.dim() == 2 && b.sizes() == at::IntArrayRef({token_count, local_v_heads}),
+      "b must have shape [N, local_v_heads].");
+  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == local_v_heads, "A_log must have shape [local_v_heads].");
+  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == local_v_heads, "dt_bias must have shape [local_v_heads].");
   TORCH_CHECK(
       recurrent_state.dim() == 4 &&
-          recurrent_state.size(1) == kNumVHeads &&
+          recurrent_state.size(1) == local_v_heads &&
           recurrent_state.size(2) == kHeadDimQK &&
           recurrent_state.size(3) == kHeadDimV,
-      "recurrent_state must have shape [pool, 48, 128, 128].");
+      "recurrent_state must have shape [pool, local_v_heads, 128, 128].");
   TORCH_CHECK(pool_idx.dim() == 1 && pool_idx.size(0) == token_count, "pool_idx must have shape [N].");
   TORCH_CHECK(
-      out.dim() == 3 && out.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimV}),
-      "out must have shape [N, 48, 128].");
+      out.dim() == 3 && out.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimV}),
+      "out must have shape [N, local_v_heads, 128].");
 
   const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
@@ -207,17 +272,20 @@ void run_qwen35_layout_scalar_kda_decode(LayoutScalarKdaDecodeParams& params) {
       mixed_qkv_conv.scalar_type(),
       "launch_qwen35_layout_scalar_kda_decode_kernel",
       [&] {
-        kernel::launch_qwen35_layout_scalar_kda_decode_kernel<scalar_t>(
-            stream,
-            mixed_qkv_conv.data_ptr<scalar_t>(),
-            a.data_ptr<scalar_t>(),
-            b.data_ptr<scalar_t>(),
-            A_log.data_ptr<float>(),
-            dt_bias.data_ptr<float>(),
-            recurrent_state.data_ptr<float>(),
-            pool_idx.data_ptr<int32_t>(),
-            out.data_ptr<scalar_t>(),
-            static_cast<int>(token_count));
+        switch (local_v_heads) {
+          case 48:
+            dispatch_layout_scalar_decode_for_heads<scalar_t, 48>(stream, mixed_qkv_conv.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 24:
+            dispatch_layout_scalar_decode_for_heads<scalar_t, 24>(stream, mixed_qkv_conv.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 12:
+            dispatch_layout_scalar_decode_for_heads<scalar_t, 12>(stream, mixed_qkv_conv.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+          case 6:
+            dispatch_layout_scalar_decode_for_heads<scalar_t, 6>(stream, mixed_qkv_conv.data_ptr<scalar_t>(), a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), recurrent_state.data_ptr<float>(), pool_idx.data_ptr<int32_t>(), out.data_ptr<scalar_t>(), static_cast<int>(token_count));
+            break;
+        }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -30,22 +30,42 @@ inline constexpr int kKDim = kNumQKHeads * kHeadDimQK;
 inline constexpr int kVDim = kNumVHeads * kHeadDimV;
 inline constexpr int kMixedQKVDim = kQDim + kKDim + kVDim;
 
+inline constexpr int local_qk_heads_from_v_heads(int local_v_heads) {
+  return local_v_heads / (kNumVHeads / kNumQKHeads);
+}
+
+inline constexpr int local_q_dim(int local_qk_heads) {
+  return local_qk_heads * kHeadDimQK;
+}
+
+inline constexpr int local_v_dim(int local_v_heads) {
+  return local_v_heads * kHeadDimV;
+}
+
+inline constexpr int local_mixed_qkv_dim(int local_qk_heads, int local_v_heads) {
+  return 2 * local_q_dim(local_qk_heads) + local_v_dim(local_v_heads);
+}
+
+inline constexpr bool is_supported_local_v_heads(int local_v_heads) {
+  return local_v_heads == 48 || local_v_heads == 24 || local_v_heads == 12 || local_v_heads == 6;
+}
+
 struct ConvDecodeParams {
-  at::Tensor mixed_qkv;   // [B, 1, 10240]
-  at::Tensor conv_state;  // [B, 10240, 4]
-  at::Tensor conv_weight; // [10240, 4]
-  at::Tensor out;         // [B, 1, 10240]
+  at::Tensor mixed_qkv;   // [B, 1, local_conv_dim]
+  at::Tensor conv_state;  // [B, local_conv_dim, 4]
+  at::Tensor conv_weight; // [local_conv_dim, 4]
+  at::Tensor out;         // [B, 1, local_conv_dim]
 };
 
 struct LayoutDecodeParams {
-  at::Tensor mixed_qkv_conv; // [N, 10240]
-  at::Tensor a;              // [N, 48]
-  at::Tensor b;              // [N, 48]
-  at::Tensor q_rep;          // [N, 48, 128]
-  at::Tensor k_rep;          // [N, 48, 128]
-  at::Tensor v;              // [N, 48, 128]
-  at::Tensor a_kernel;       // [N, 48]
-  at::Tensor b_kernel;       // [N, 48]
+  at::Tensor mixed_qkv_conv; // [N, local_conv_dim]
+  at::Tensor a;              // [N, local_v_heads]
+  at::Tensor b;              // [N, local_v_heads]
+  at::Tensor q_rep;          // [N, local_v_heads, 128]
+  at::Tensor k_rep;          // [N, local_v_heads, 128]
+  at::Tensor v;              // [N, local_v_heads, 128]
+  at::Tensor a_kernel;       // [N, local_v_heads]
+  at::Tensor b_kernel;       // [N, local_v_heads]
 };
 
 struct ScalarKdaDecodeParams {
@@ -54,27 +74,27 @@ struct ScalarKdaDecodeParams {
   //     q_rep, k_rep, v, a_kernel, b_kernel, out
   // - recurrent parameters / state: float32
   //     A_log, dt_bias, recurrent_state
-  at::Tensor q_rep;            // [N, 48, 128]
-  at::Tensor k_rep;            // [N, 48, 128]
-  at::Tensor v;                // [N, 48, 128]
-  at::Tensor a_kernel;         // [N, 48]
-  at::Tensor b_kernel;         // [N, 48]
-  at::Tensor A_log;            // [48], float32
-  at::Tensor dt_bias;          // [48], float32
-  at::Tensor recurrent_state;  // [pool, 48, 128, 128], float32
+  at::Tensor q_rep;            // [N, local_v_heads, 128]
+  at::Tensor k_rep;            // [N, local_v_heads, 128]
+  at::Tensor v;                // [N, local_v_heads, 128]
+  at::Tensor a_kernel;         // [N, local_v_heads]
+  at::Tensor b_kernel;         // [N, local_v_heads]
+  at::Tensor A_log;            // [local_v_heads], float32
+  at::Tensor dt_bias;          // [local_v_heads], float32
+  at::Tensor recurrent_state;  // [pool, local_v_heads, 128, 128], float32
   at::Tensor pool_idx;         // [N], int32
-  at::Tensor out;              // [N, 48, 128]
+  at::Tensor out;              // [N, local_v_heads, 128]
 };
 
 struct LayoutScalarKdaDecodeParams {
-  at::Tensor mixed_qkv_conv;    // [N, 10240]
-  at::Tensor a;                 // [N, 48]
-  at::Tensor b;                 // [N, 48]
-  at::Tensor A_log;             // [48], float32
-  at::Tensor dt_bias;           // [48], float32
-  at::Tensor recurrent_state;   // [pool, 48, 128, 128], float32
+  at::Tensor mixed_qkv_conv;    // [N, local_conv_dim]
+  at::Tensor a;                 // [N, local_v_heads]
+  at::Tensor b;                 // [N, local_v_heads]
+  at::Tensor A_log;             // [local_v_heads], float32
+  at::Tensor dt_bias;           // [local_v_heads], float32
+  at::Tensor recurrent_state;   // [pool, local_v_heads, 128, 128], float32
   at::Tensor pool_idx;          // [N], int32
-  at::Tensor out;               // [N, 48, 128]
+  at::Tensor out;               // [N, local_v_heads, 128]
 };
 
 void run_qwen35_conv1d_decode(ConvDecodeParams& params);

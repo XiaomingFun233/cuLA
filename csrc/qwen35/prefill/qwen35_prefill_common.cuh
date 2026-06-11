@@ -30,28 +30,28 @@ using decode::kQDim;
 using decode::kVDim;
 
 struct LayoutPrefillParams {
-  at::Tensor mixed_qkv_conv; // [N, 10240]
-  at::Tensor a;              // [N, 48]
-  at::Tensor b;              // [N, 48]
-  at::Tensor q_rep;          // [N, 48, 128]
-  at::Tensor k_rep;          // [N, 48, 128]
-  at::Tensor v;              // [N, 48, 128]
-  at::Tensor a_kernel;       // [N, 48]
-  at::Tensor b_kernel;       // [N, 48]
+  at::Tensor mixed_qkv_conv; // [N, local_conv_dim]
+  at::Tensor a;              // [N, local_v_heads]
+  at::Tensor b;              // [N, local_v_heads]
+  at::Tensor q_rep;          // [N, local_v_heads, 128]
+  at::Tensor k_rep;          // [N, local_v_heads, 128]
+  at::Tensor v;              // [N, local_v_heads, 128]
+  at::Tensor a_kernel;       // [N, local_v_heads]
+  at::Tensor b_kernel;       // [N, local_v_heads]
 };
 
 struct ScalarKdaPrefillParams {
-  at::Tensor q;                // [B, T, 48, 128]
-  at::Tensor k;                // [B, T, 48, 128]
-  at::Tensor v;                // [B, T, 48, 128]
-  at::Tensor a;                // [B, T, 48]
-  at::Tensor b;                // [B, T, 48]
-  at::Tensor A_log;            // [48], float32
-  at::Tensor dt_bias;          // [48], float32
-  at::Tensor initial_state;    // [N, 48, 128, 128], float32, may be empty
+  at::Tensor q;                // [B, T, local_v_heads, 128]
+  at::Tensor k;                // [B, T, local_v_heads, 128]
+  at::Tensor v;                // [B, T, local_v_heads, 128]
+  at::Tensor a;                // [B, T, local_v_heads]
+  at::Tensor b;                // [B, T, local_v_heads]
+  at::Tensor A_log;            // [local_v_heads], float32
+  at::Tensor dt_bias;          // [local_v_heads], float32
+  at::Tensor initial_state;    // [N, local_v_heads, 128, 128], float32, may be empty
   at::Tensor cu_seqlens;       // [N + 1], int32, may be empty
-  at::Tensor out;              // [B, T, 48, 128]
-  at::Tensor final_state;      // [N, 48, 128, 128], float32
+  at::Tensor out;              // [B, T, local_v_heads, 128]
+  at::Tensor final_state;      // [N, local_v_heads, 128, 128], float32
 };
 
 void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params);

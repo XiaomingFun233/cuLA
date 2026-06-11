@@ -73,8 +73,7 @@ def qwen35_layout_prefill(
     if use_cudac:
         tokens = mixed_qkv_conv.shape[0]
         local_num_v_heads = a.shape[1]
-        if local_num_v_heads != 48:
-            raise ValueError(f"backend='cudac' currently expects Qwen3.5 HV=48, got {local_num_v_heads}")
+        infer_local_config(mixed_qkv_conv.shape[1], local_num_v_heads, config=config)
         q_rep = torch.empty(tokens, local_num_v_heads, config.head_k_dim, device=mixed_qkv_conv.device, dtype=mixed_qkv_conv.dtype)
         k_rep = torch.empty_like(q_rep)
         v = torch.empty(tokens, local_num_v_heads, config.head_v_dim, device=mixed_qkv_conv.device, dtype=mixed_qkv_conv.dtype)

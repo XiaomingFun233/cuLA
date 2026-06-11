@@ -36,6 +36,81 @@ void check_contiguous(const at::Tensor& tensor, const char* name) {
   }
 }
 
+template <typename scalar_t, int kLocalVHeads>
+void dispatch_scalar_prefill_for_heads(
+    cudaStream_t stream,
+    const scalar_t* q,
+    const scalar_t* k,
+    const scalar_t* v,
+    const scalar_t* a,
+    const scalar_t* b,
+    const float* A_log,
+    const float* dt_bias,
+    const float* initial_state,
+    const int32_t* cu_seqlens,
+    scalar_t* out,
+    float* final_state,
+    int batch_size,
+    int seq_len,
+    int sequence_count,
+    bool is_varlen,
+    bool has_initial_state) {
+  kernel::launch_qwen35_scalar_kda_prefill_kernel<scalar_t, kLocalVHeads>(
+      stream,
+      q,
+      k,
+      v,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      initial_state,
+      cu_seqlens,
+      out,
+      final_state,
+      batch_size,
+      seq_len,
+      sequence_count,
+      is_varlen,
+      has_initial_state);
+}
+
+template <typename scalar_t>
+void dispatch_scalar_prefill(
+    int64_t local_v_heads,
+    cudaStream_t stream,
+    const scalar_t* q,
+    const scalar_t* k,
+    const scalar_t* v,
+    const scalar_t* a,
+    const scalar_t* b,
+    const float* A_log,
+    const float* dt_bias,
+    const float* initial_state,
+    const int32_t* cu_seqlens,
+    scalar_t* out,
+    float* final_state,
+    int batch_size,
+    int seq_len,
+    int sequence_count,
+    bool is_varlen,
+    bool has_initial_state) {
+  switch (local_v_heads) {
+    case 48:
+      dispatch_scalar_prefill_for_heads<scalar_t, 48>(stream, q, k, v, a, b, A_log, dt_bias, initial_state, cu_seqlens, out, final_state, batch_size, seq_len, sequence_count, is_varlen, has_initial_state);
+      break;
+    case 24:
+      dispatch_scalar_prefill_for_heads<scalar_t, 24>(stream, q, k, v, a, b, A_log, dt_bias, initial_state, cu_seqlens, out, final_state, batch_size, seq_len, sequence_count, is_varlen, has_initial_state);
+      break;
+    case 12:
+      dispatch_scalar_prefill_for_heads<scalar_t, 12>(stream, q, k, v, a, b, A_log, dt_bias, initial_state, cu_seqlens, out, final_state, batch_size, seq_len, sequence_count, is_varlen, has_initial_state);
+      break;
+    case 6:
+      dispatch_scalar_prefill_for_heads<scalar_t, 6>(stream, q, k, v, a, b, A_log, dt_bias, initial_state, cu_seqlens, out, final_state, batch_size, seq_len, sequence_count, is_varlen, has_initial_state);
+      break;
+  }
+}
+
 } // namespace
 
 void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params) {
@@ -96,15 +171,17 @@ void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params) {
   TORCH_CHECK(q.dim() == 4, "q must be [B, T, 48, 128].");
   const int64_t B = q.size(0);
   const int64_t T = q.size(1);
+  const int64_t local_v_heads = q.size(2);
+  TORCH_CHECK(decode::is_supported_local_v_heads(static_cast<int>(local_v_heads)), "local V heads must be one of {48, 24, 12, 6}, got ", local_v_heads, ".");
   TORCH_CHECK(
-      q.sizes() == at::IntArrayRef({B, T, kNumVHeads, kHeadDimQK}),
-      "q must have shape [B, T, 48, 128].");
+      q.sizes() == at::IntArrayRef({B, T, local_v_heads, kHeadDimQK}),
+      "q must have shape [B, T, local_v_heads, 128].");
   TORCH_CHECK(k.sizes() == q.sizes(), "k must match q shape.");
   TORCH_CHECK(v.sizes() == q.sizes(), "v must match q shape.");
-  TORCH_CHECK(a.dim() == 3 && a.sizes() == at::IntArrayRef({B, T, kNumVHeads}), "a must be [B, T, 48].");
+  TORCH_CHECK(a.dim() == 3 && a.sizes() == at::IntArrayRef({B, T, local_v_heads}), "a must be [B, T, local_v_heads].");
   TORCH_CHECK(b.sizes() == a.sizes(), "b must match a shape.");
-  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == kNumVHeads, "A_log must be [48].");
-  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == kNumVHeads, "dt_bias must be [48].");
+  TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == local_v_heads, "A_log must be [local_v_heads].");
+  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == local_v_heads, "dt_bias must be [local_v_heads].");
   TORCH_CHECK(out.sizes() == q.sizes(), "out must match q shape.");
 
   const bool is_varlen = cu_seqlens.defined() && cu_seqlens.numel() > 0;
@@ -116,8 +193,8 @@ void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params) {
 
   TORCH_CHECK(
       final_state.dim() == 4 &&
-          final_state.sizes() == at::IntArrayRef({sequence_count, kNumVHeads, kHeadDimQK, kHeadDimV}),
-      "final_state must be [N, 48, 128, 128].");
+          final_state.sizes() == at::IntArrayRef({sequence_count, local_v_heads, kHeadDimQK, kHeadDimV}),
+      "final_state must be [N, local_v_heads, 128, 128].");
   const bool has_initial_state = initial_state.defined() && initial_state.numel() > 0;
   if (has_initial_state) {
     TORCH_CHECK(initial_state.sizes() == final_state.sizes(), "initial_state must match final_state shape.");
@@ -127,7 +204,8 @@ void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params) {
   cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
 
   if (q.scalar_type() == at::kHalf) {
-    kernel::launch_qwen35_scalar_kda_prefill_kernel<c10::Half>(
+    dispatch_scalar_prefill<c10::Half>(
+        local_v_heads,
         stream,
         q.data_ptr<c10::Half>(),
         k.data_ptr<c10::Half>(),
@@ -146,7 +224,8 @@ void run_qwen35_scalar_kda_prefill(ScalarKdaPrefillParams& params) {
         is_varlen,
         has_initial_state);
   } else {
-    kernel::launch_qwen35_scalar_kda_prefill_kernel<c10::BFloat16>(
+    dispatch_scalar_prefill<c10::BFloat16>(
+        local_v_heads,
         stream,
         q.data_ptr<c10::BFloat16>(),
         k.data_ptr<c10::BFloat16>(),

@@ -45,7 +45,7 @@ CUTE_DEVICE void copy_vec_contiguous(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
 __global__ void qwen35_layout_decode_kernel_cute(
     const scalar_t* __restrict__ mixed_qkv_conv,
     const scalar_t* __restrict__ a,
@@ -56,8 +56,11 @@ __global__ void qwen35_layout_decode_kernel_cute(
     scalar_t* __restrict__ a_kernel,
     scalar_t* __restrict__ b_kernel,
     int64_t token_count) {
-  static_assert(kNumVHeads % kNumQKHeads == 0);
-  constexpr int kRepeatFactor = kNumVHeads / kNumQKHeads;
+  static_assert(kLocalVHeads % kLocalQKHeads == 0);
+  constexpr int kRepeatFactor = kLocalVHeads / kLocalQKHeads;
+  constexpr int kLocalQDim = kLocalQKHeads * kHeadDimQK;
+  constexpr int kLocalKDim = kLocalQKHeads * kHeadDimQK;
+  constexpr int kLocalMixedQKVDim = 2 * kLocalQDim + kLocalVHeads * kHeadDimV;
   // TODO(qwen35-layout-opt):
   // - Re-evaluate whether Vec=8 is profitable for bf16/fp16 on the target GPUs.
   // - Push more of the q/k repeat mapping into compile-time CuTe layout transforms.
@@ -72,31 +75,31 @@ __global__ void qwen35_layout_decode_kernel_cute(
   const int hv = static_cast<int>(blockIdx.x);
   const int tid = static_cast<int>(threadIdx.x);
 
-  if (token_idx >= token_count || hv >= kNumVHeads) {
+  if (token_idx >= token_count || hv >= kLocalVHeads) {
     return;
   }
 
   const int mapped_h = hv / kRepeatFactor;
 
   auto qk_src_layout = make_layout(
-      make_shape(Int<kNumQKHeads>{}, Int<kHeadDimQK>{}),
+      make_shape(Int<kLocalQKHeads>{}, Int<kHeadDimQK>{}),
       make_stride(Int<kHeadDimQK>{}, Int<1>{}));
   auto v_src_layout = make_layout(
-      make_shape(Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+      make_shape(Int<kLocalVHeads>{}, Int<kHeadDimV>{}),
       make_stride(Int<kHeadDimV>{}, Int<1>{}));
   auto out_layout = make_layout(
-      make_shape(Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+      make_shape(Int<kLocalVHeads>{}, Int<kHeadDimV>{}),
       make_stride(Int<kHeadDimV>{}, Int<1>{}));
-  auto head_layout = make_layout(make_shape(Int<kNumVHeads>{}), make_stride(Int<1>{}));
+  auto head_layout = make_layout(make_shape(Int<kLocalVHeads>{}), make_stride(Int<1>{}));
 
-  const scalar_t* token_ptr = mixed_qkv_conv + static_cast<int64_t>(token_idx) * kMixedQKVDim;
+  const scalar_t* token_ptr = mixed_qkv_conv + static_cast<int64_t>(token_idx) * kLocalMixedQKVDim;
   const scalar_t* q_src_ptr = token_ptr;
-  const scalar_t* k_src_ptr = token_ptr + kQDim;
-  const scalar_t* v_src_ptr = token_ptr + kQDim + kKDim;
+  const scalar_t* k_src_ptr = token_ptr + kLocalQDim;
+  const scalar_t* v_src_ptr = token_ptr + kLocalQDim + kLocalKDim;
 
-  scalar_t* q_dst_ptr = q_rep + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimQK;
-  scalar_t* k_dst_ptr = k_rep + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimQK;
-  scalar_t* v_dst_ptr = v_out + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimV;
+  scalar_t* q_dst_ptr = q_rep + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimQK;
+  scalar_t* k_dst_ptr = k_rep + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimQK;
+  scalar_t* v_dst_ptr = v_out + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimV;
 
   // Current version uses a direct GMEM->GMEM vector copy path. This keeps the
   // kernel simple while already removing the scalar-copy bottleneck from the
@@ -118,7 +121,7 @@ __global__ void qwen35_layout_decode_kernel_cute(
     // TODO(qwen35-layout-opt): If a/b copy becomes measurable, fuse a wider
     // per-head copy path here instead of scalar head writes.
     const int head_idx = crd2idx(make_coord(hv), head_layout);
-    const int64_t token_head_offset = static_cast<int64_t>(token_idx) * kNumVHeads + head_idx;
+    const int64_t token_head_offset = static_cast<int64_t>(token_idx) * kLocalVHeads + head_idx;
     a_kernel[token_head_offset] = a[token_head_offset];
     b_kernel[token_head_offset] = b[token_head_offset];
   }

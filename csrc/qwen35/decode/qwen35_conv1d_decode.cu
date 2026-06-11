@@ -67,20 +67,21 @@ __global__ void qwen35_conv1d_decode_kernel(
     scalar_t* __restrict__ conv_state,
     const scalar_t* __restrict__ conv_weight,
     scalar_t* __restrict__ out,
-    int batch_size) {
+    int batch_size,
+    int conv_dim) {
   constexpr int kThreads = 256;
   const int64_t linear_idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
-  const int64_t total = static_cast<int64_t>(batch_size) * cula::qwen35::decode::kMixedQKVDim;
+  const int64_t total = static_cast<int64_t>(batch_size) * conv_dim;
   if (linear_idx >= total) {
     return;
   }
 
-  const int64_t b = linear_idx / cula::qwen35::decode::kMixedQKVDim;
-  const int64_t c = linear_idx % cula::qwen35::decode::kMixedQKVDim;
+  const int64_t b = linear_idx / conv_dim;
+  const int64_t c = linear_idx % conv_dim;
 
-  const int64_t x_idx = b * cula::qwen35::decode::kMixedQKVDim + c;
+  const int64_t x_idx = b * conv_dim + c;
   const int64_t state_base =
-      (b * cula::qwen35::decode::kMixedQKVDim + c) * cula::qwen35::decode::kConvKernelSize;
+      (b * conv_dim + c) * cula::qwen35::decode::kConvKernelSize;
   const int64_t weight_base = c * cula::qwen35::decode::kConvKernelSize;
 
   const float s0 = to_float(conv_state[state_base + 1]);
@@ -140,32 +141,34 @@ void run_qwen35_conv1d_decode(ConvDecodeParams& params) {
       "conv decode only supports half/bfloat16.");
 
   const int64_t batch_size = mixed_qkv.size(0);
+  const int64_t conv_dim = mixed_qkv.size(2);
+  TORCH_CHECK(conv_dim > 0, "conv_dim must be positive.");
   TORCH_CHECK(
-      mixed_qkv.dim() == 3 && mixed_qkv.sizes() == at::IntArrayRef({batch_size, 1, kMixedQKVDim}),
-      "mixed_qkv must have shape [B, 1, 10240].");
+      mixed_qkv.dim() == 3 && mixed_qkv.sizes() == at::IntArrayRef({batch_size, 1, conv_dim}),
+      "mixed_qkv must have shape [B, 1, local_conv_dim].");
   TORCH_CHECK(
       conv_state.dim() == 3 &&
-          conv_state.sizes() == at::IntArrayRef({batch_size, kMixedQKVDim, kConvKernelSize}),
-      "conv_state must have shape [B, 10240, 4].");
+          conv_state.sizes() == at::IntArrayRef({batch_size, conv_dim, kConvKernelSize}),
+      "conv_state must have shape [B, local_conv_dim, 4].");
   TORCH_CHECK(
-      (conv_weight.dim() == 2 && conv_weight.sizes() == at::IntArrayRef({kMixedQKVDim, kConvKernelSize})) ||
+      (conv_weight.dim() == 2 && conv_weight.sizes() == at::IntArrayRef({conv_dim, kConvKernelSize})) ||
           (conv_weight.dim() == 3 &&
-           conv_weight.sizes() == at::IntArrayRef({kMixedQKVDim, 1, kConvKernelSize})),
-      "conv_weight must have shape [10240, 4] or [10240, 1, 4].");
+           conv_weight.sizes() == at::IntArrayRef({conv_dim, 1, kConvKernelSize})),
+      "conv_weight must have shape [local_conv_dim, 4] or [local_conv_dim, 1, 4].");
   TORCH_CHECK(
-      out.dim() == 3 && out.sizes() == at::IntArrayRef({batch_size, 1, kMixedQKVDim}),
-      "out must have shape [B, 1, 10240].");
+      out.dim() == 3 && out.sizes() == at::IntArrayRef({batch_size, 1, conv_dim}),
+      "out must have shape [B, 1, local_conv_dim].");
 
   const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
 
-  const at::Tensor mixed_qkv_2d = mixed_qkv.view({batch_size, kMixedQKVDim});
-  const at::Tensor out_2d = out.view({batch_size, kMixedQKVDim});
+  const at::Tensor mixed_qkv_2d = mixed_qkv.view({batch_size, conv_dim});
+  const at::Tensor out_2d = out.view({batch_size, conv_dim});
   const at::Tensor weight_2d =
-      conv_weight.dim() == 3 ? conv_weight.view({kMixedQKVDim, kConvKernelSize}) : conv_weight;
+      conv_weight.dim() == 3 ? conv_weight.view({conv_dim, kConvKernelSize}) : conv_weight;
 
   constexpr int kThreads = 256;
-  const int64_t total = batch_size * static_cast<int64_t>(kMixedQKVDim);
+  const int64_t total = batch_size * conv_dim;
   const dim3 block(kThreads, 1, 1);
   const dim3 grid(static_cast<unsigned int>((total + kThreads - 1) / kThreads), 1, 1);
 
@@ -180,7 +183,8 @@ void run_qwen35_conv1d_decode(ConvDecodeParams& params) {
             conv_state.data_ptr<scalar_t>(),
             weight_2d.data_ptr<scalar_t>(),
             out_2d.data_ptr<scalar_t>(),
-            static_cast<int>(batch_size));
+            static_cast<int>(batch_size),
+            static_cast<int>(conv_dim));
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

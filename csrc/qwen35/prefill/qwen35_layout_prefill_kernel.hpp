@@ -46,7 +46,7 @@ CUTE_DEVICE void copy_prefill_vec_contiguous(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
 __global__ void qwen35_layout_prefill_kernel(
     const scalar_t* __restrict__ mixed_qkv_conv,
     const scalar_t* __restrict__ a,
@@ -57,40 +57,43 @@ __global__ void qwen35_layout_prefill_kernel(
     scalar_t* __restrict__ a_kernel,
     scalar_t* __restrict__ b_kernel,
     int64_t token_count) {
-  static_assert(kNumVHeads % kNumQKHeads == 0);
+  static_assert(kLocalVHeads % kLocalQKHeads == 0);
   static_assert(kHeadDimQK == kHeadDimV);
-  constexpr int kRepeatFactor = kNumVHeads / kNumQKHeads;
+  constexpr int kRepeatFactor = kLocalVHeads / kLocalQKHeads;
+  constexpr int kLocalQDim = kLocalQKHeads * kHeadDimQK;
+  constexpr int kLocalKDim = kLocalQKHeads * kHeadDimQK;
+  constexpr int kLocalMixedQKVDim = 2 * kLocalQDim + kLocalVHeads * kHeadDimV;
   constexpr int kVec = 4;
   static_assert(kHeadDimQK % kVec == 0);
 
   const int hv = static_cast<int>(blockIdx.x);
   const int token_idx = static_cast<int>(blockIdx.y);
   const int tid = static_cast<int>(threadIdx.x);
-  if (token_idx >= token_count || hv >= kNumVHeads) {
+  if (token_idx >= token_count || hv >= kLocalVHeads) {
     return;
   }
 
   const int mapped_h = hv / kRepeatFactor;
 
   auto qk_src_layout = make_layout(
-      make_shape(Int<kNumQKHeads>{}, Int<kHeadDimQK>{}),
+      make_shape(Int<kLocalQKHeads>{}, Int<kHeadDimQK>{}),
       make_stride(Int<kHeadDimQK>{}, Int<1>{}));
   auto v_src_layout = make_layout(
-      make_shape(Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+      make_shape(Int<kLocalVHeads>{}, Int<kHeadDimV>{}),
       make_stride(Int<kHeadDimV>{}, Int<1>{}));
   auto hv_layout = make_layout(
-      make_shape(Int<kNumVHeads>{}, Int<kHeadDimV>{}),
+      make_shape(Int<kLocalVHeads>{}, Int<kHeadDimV>{}),
       make_stride(Int<kHeadDimV>{}, Int<1>{}));
-  auto head_layout = make_layout(make_shape(Int<kNumVHeads>{}), make_stride(Int<1>{}));
+  auto head_layout = make_layout(make_shape(Int<kLocalVHeads>{}), make_stride(Int<1>{}));
 
-  const scalar_t* token_ptr = mixed_qkv_conv + static_cast<int64_t>(token_idx) * kMixedQKVDim;
+  const scalar_t* token_ptr = mixed_qkv_conv + static_cast<int64_t>(token_idx) * kLocalMixedQKVDim;
   const scalar_t* q_src_ptr = token_ptr;
-  const scalar_t* k_src_ptr = token_ptr + kQDim;
-  const scalar_t* v_src_ptr = token_ptr + kQDim + kKDim;
+  const scalar_t* k_src_ptr = token_ptr + kLocalQDim;
+  const scalar_t* v_src_ptr = token_ptr + kLocalQDim + kLocalKDim;
 
-  scalar_t* q_dst_ptr = q_rep + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimQK;
-  scalar_t* k_dst_ptr = k_rep + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimQK;
-  scalar_t* v_dst_ptr = v_out + static_cast<int64_t>(token_idx) * kNumVHeads * kHeadDimV;
+  scalar_t* q_dst_ptr = q_rep + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimQK;
+  scalar_t* k_dst_ptr = k_rep + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimQK;
+  scalar_t* v_dst_ptr = v_out + static_cast<int64_t>(token_idx) * kLocalVHeads * kHeadDimV;
 
   for (int vec_idx = tid; vec_idx < kHeadDimQK / kVec; vec_idx += blockDim.x) {
     const int d = vec_idx * kVec;
@@ -106,13 +109,13 @@ __global__ void qwen35_layout_prefill_kernel(
 
   if (tid == 0) {
     const int head_idx = crd2idx(make_coord(hv), head_layout);
-    const int64_t token_head_offset = static_cast<int64_t>(token_idx) * kNumVHeads + head_idx;
+    const int64_t token_head_offset = static_cast<int64_t>(token_idx) * kLocalVHeads + head_idx;
     a_kernel[token_head_offset] = a[token_head_offset];
     b_kernel[token_head_offset] = b[token_head_offset];
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
 void launch_qwen35_layout_prefill_kernel(
     cudaStream_t stream,
     const scalar_t* mixed_qkv_conv,
@@ -125,8 +128,8 @@ void launch_qwen35_layout_prefill_kernel(
     scalar_t* b_kernel,
     int64_t token_count) {
   constexpr int kThreads = 32;
-  dim3 grid(kNumVHeads, static_cast<unsigned int>(token_count), 1);
-  qwen35_layout_prefill_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
+  dim3 grid(kLocalVHeads, static_cast<unsigned int>(token_count), 1);
+  qwen35_layout_prefill_kernel<scalar_t, kLocalQKHeads, kLocalVHeads><<<grid, kThreads, 0, stream>>>(
       mixed_qkv_conv,
       a,
       b,

@@ -77,6 +77,7 @@ def qwen35_layout_decode(
     if use_cudac:
         tokens = mixed_qkv_conv.shape[0]
         local_num_v_heads = a.shape[1]
+        infer_local_config(mixed_qkv_conv.shape[1], local_num_v_heads, config=config)
         q_rep = torch.empty(
             tokens,
             local_num_v_heads,

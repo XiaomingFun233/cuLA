@@ -23,7 +23,7 @@ namespace cula::qwen35::prefill::kernel {
 
 using namespace cute;
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalVHeads>
 struct Qwen35ScalarKdaPrefillKernel {
   static constexpr int kThreads = 128;
   static constexpr int kHeadDim = kHeadDimQK;
@@ -48,8 +48,8 @@ struct Qwen35ScalarKdaPrefillKernel {
 
   CUTE_HOST_DEVICE static auto make_v_work_tiles(int sequence_count) {
     auto problem_layout = make_layout(
-        make_shape(Int<kHeadDimV>{}, Int<kNumVHeads>{}, sequence_count),
-        make_stride(Int<1>{}, Int<kHeadDimV>{}, Int<kHeadDimV * kNumVHeads>{}));
+        make_shape(Int<kHeadDimV>{}, Int<kLocalVHeads>{}, sequence_count),
+        make_stride(Int<1>{}, Int<kHeadDimV>{}, Int<kHeadDimV * kLocalVHeads>{}));
     return zipped_divide(problem_layout, make_shape(Int<kVTile>{}, Int<1>{}, Int<1>{}));
   }
 
@@ -80,7 +80,9 @@ struct Qwen35ScalarKdaPrefillKernel {
       }
       __syncthreads();
     }
-    return storage.scratch[0];
+    const float result = storage.scratch[0];
+    __syncthreads();
+    return result;
   }
 
   CUTE_DEVICE static void run_device(
@@ -110,13 +112,13 @@ struct Qwen35ScalarKdaPrefillKernel {
     const int v_base = v_tile_idx * kVTile;
     const int tid = static_cast<int>(threadIdx.x);
 
-    if (hv >= kNumVHeads || seq_idx >= sequence_count) {
+    if (hv >= kLocalVHeads || seq_idx >= sequence_count) {
       return;
     }
 
     const int token_begin = is_varlen ? static_cast<int>(cu_seqlens[seq_idx]) : seq_idx * seq_len;
     const int token_end = is_varlen ? static_cast<int>(cu_seqlens[seq_idx + 1]) : token_begin + seq_len;
-    const int state_base = ((seq_idx * kNumVHeads + hv) * kHeadDimQK) * kHeadDimV;
+    const int state_base = ((seq_idx * kLocalVHeads + hv) * kHeadDimQK) * kHeadDimV;
 
     const int kk = tid;
     float state_vals[kVTile];
@@ -138,8 +140,8 @@ struct Qwen35ScalarKdaPrefillKernel {
 
     for (int token = token_begin; token < token_end; ++token) {
       const int local_t = is_varlen ? token : token - token_begin;
-      const int qkv_base = ((token * kNumVHeads + hv) * kHeadDimQK);
-      const int gate_base = token * kNumVHeads + hv;
+      const int qkv_base = ((token * kLocalVHeads + hv) * kHeadDimQK);
+      const int gate_base = token * kLocalVHeads + hv;
 
       const float q_val = kk < kHeadDimQK ? load_as_float(q[qkv_base + kk]) : 0.0f;
       const float k_val = kk < kHeadDimQK ? load_as_float(k[qkv_base + kk]) : 0.0f;
@@ -174,7 +176,7 @@ struct Qwen35ScalarKdaPrefillKernel {
 
           if (tid == 0) {
             const int out_off =
-                (((is_varlen ? 0 : seq_idx) * seq_len + local_t) * kNumVHeads + hv) * kHeadDimV + v_row;
+                (((is_varlen ? 0 : seq_idx) * seq_len + local_t) * kLocalVHeads + hv) * kHeadDimV + v_row;
             out[out_off] = cast_output(out_acc);
           }
         }
@@ -195,7 +197,7 @@ struct Qwen35ScalarKdaPrefillKernel {
   }
 };
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalVHeads>
 __global__ void qwen35_scalar_kda_prefill_kernel(
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
@@ -213,8 +215,8 @@ __global__ void qwen35_scalar_kda_prefill_kernel(
     int sequence_count,
     bool is_varlen,
     bool has_initial_state) {
-  __shared__ typename Qwen35ScalarKdaPrefillKernel<scalar_t>::SharedStorage storage;
-  Qwen35ScalarKdaPrefillKernel<scalar_t>::run_device(
+  __shared__ typename Qwen35ScalarKdaPrefillKernel<scalar_t, kLocalVHeads>::SharedStorage storage;
+  Qwen35ScalarKdaPrefillKernel<scalar_t, kLocalVHeads>::run_device(
       q,
       k,
       v,
@@ -234,7 +236,7 @@ __global__ void qwen35_scalar_kda_prefill_kernel(
       storage);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int kLocalVHeads>
 void launch_qwen35_scalar_kda_prefill_kernel(
     cudaStream_t stream,
     const scalar_t* q,
@@ -253,9 +255,9 @@ void launch_qwen35_scalar_kda_prefill_kernel(
     int sequence_count,
     bool is_varlen,
     bool has_initial_state) {
-  const auto grid = Qwen35ScalarKdaPrefillKernel<scalar_t>::grid_shape(sequence_count);
-  const auto block = Qwen35ScalarKdaPrefillKernel<scalar_t>::block_shape();
-  qwen35_scalar_kda_prefill_kernel<scalar_t><<<grid, block, 0, stream>>>(
+  const auto grid = Qwen35ScalarKdaPrefillKernel<scalar_t, kLocalVHeads>::grid_shape(sequence_count);
+  const auto block = Qwen35ScalarKdaPrefillKernel<scalar_t, kLocalVHeads>::block_shape();
+  qwen35_scalar_kda_prefill_kernel<scalar_t, kLocalVHeads><<<grid, block, 0, stream>>>(
       q,
       k,
       v,

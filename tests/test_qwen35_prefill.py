@@ -17,6 +17,7 @@ import pathlib
 import sys
 
 import torch
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -64,6 +65,10 @@ def _manual_scalar_prefill(q, k, v, a, b, A_log, dt_bias, initial_state=None, cu
         for state_idx in range(state_count):
             run_seq(0, state_idx, int(cu_seqlens[state_idx].item()), int(cu_seqlens[state_idx + 1].item()))
     return out, state
+
+
+def _local_config(local_v_heads: int) -> Qwen35LinearAttentionConfig:
+    return Qwen35LinearAttentionConfig(num_k_heads=local_v_heads // 3, num_v_heads=local_v_heads)
 
 
 def test_qwen35_scalar_kda_prefill_reference_matches_manual():
@@ -170,6 +175,72 @@ def test_qwen35_scalar_kda_prefill_cuda_matches_reference():
     torch.testing.assert_close(state, state_ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_layout_prefill_cuda_supports_local_tp_shards(local_v_heads: int):
+    if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_layout_prefill"):
+        pytest.skip("qwen35_layout_prefill CUDA extension is not available")
+
+    torch.manual_seed(20 + local_v_heads)
+    device = torch.device("cuda")
+    config = _local_config(local_v_heads)
+    tokens = 5
+    mixed_qkv = torch.randn(tokens, config.conv_dim, device=device, dtype=torch.bfloat16)
+    a = torch.randn(tokens, config.num_v_heads, device=device, dtype=torch.bfloat16)
+    b = torch.randn(tokens, config.num_v_heads, device=device, dtype=torch.bfloat16)
+
+    ref = qwen35_layout_prefill_reference(mixed_qkv, a, b, config=config)
+    out = qwen35_layout_prefill(mixed_qkv, a, b, config=config, backend="cudac")
+
+    torch.cuda.synchronize()
+    for out_tensor, ref_tensor in zip(out, ref, strict=True):
+        torch.testing.assert_close(out_tensor, ref_tensor)
+
+
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_scalar_kda_prefill_cuda_supports_local_tp_shards(local_v_heads: int):
+    if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_scalar_kda_prefill"):
+        pytest.skip("qwen35_scalar_kda_prefill CUDA extension is not available")
+
+    torch.manual_seed(30 + local_v_heads)
+    device = torch.device("cuda")
+    B, T, HV, K = 1, 4, local_v_heads, 128
+    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    a = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
+    A_log = -torch.rand(HV, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(HV, device=device, dtype=torch.float32) * 0.1
+    initial_state = torch.randn(B, HV, K, K, device=device, dtype=torch.float32) * 0.01
+
+    out_ref, state_ref = qwen35_scalar_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+        backend="reference",
+    )
+    out, state = qwen35_scalar_kda_prefill(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state=initial_state,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(state, state_ref, atol=2e-2, rtol=2e-2)
+
+
 def test_qwen35_chunk_qk_prefill_sm90_matches_torch():
     if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_chunk_qk_prefill_sm90"):
         import pytest
@@ -179,6 +250,25 @@ def test_qwen35_chunk_qk_prefill_sm90_matches_torch():
     torch.manual_seed(11)
     device = torch.device("cuda")
     B, T, HV, K = 1, 64, 48, 128
+    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    out = torch.empty(B, HV, T, T, device=device, dtype=torch.float32)
+
+    cula_cuda.qwen35_chunk_qk_prefill_sm90(q.contiguous(), k.contiguous(), out)
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bthd,bshd->bhts", q.float(), k.float())
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_chunk_qk_prefill_sm90_supports_local_tp_shards(local_v_heads: int):
+    if not torch.cuda.is_available() or cula_cuda is None or not hasattr(cula_cuda, "qwen35_chunk_qk_prefill_sm90"):
+        pytest.skip("qwen35_chunk_qk_prefill_sm90 CUDA extension is not available")
+
+    torch.manual_seed(40 + local_v_heads)
+    device = torch.device("cuda")
+    B, T, HV, K = 1, 32, local_v_heads, 128
     q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     out = torch.empty(B, HV, T, T, device=device, dtype=torch.float32)

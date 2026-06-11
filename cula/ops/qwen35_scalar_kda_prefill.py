@@ -72,8 +72,8 @@ def qwen35_scalar_kda_prefill(
         raise RuntimeError("Requested backend='cudac' but qwen35_scalar_kda_prefill is not available.")
 
     if use_cudac:
-        if HV != 48:
-            raise ValueError(f"backend='cudac' currently expects Qwen3.5 HV=48, got {HV}")
+        if HV not in (48, 24, 12, 6):
+            raise ValueError(f"backend='cudac' supports Qwen3.5 local HV in (48, 24, 12, 6), got {HV}")
         state_count = B if cu_seqlens is None else cu_seqlens.numel() - 1
         out = torch.empty_like(v)
         final_state = torch.empty(state_count, HV, K, K, device=q.device, dtype=torch.float32)

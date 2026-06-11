@@ -32,6 +32,61 @@ void check_rank_2(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2, got rank ", tensor.dim(), ".");
 }
 
+template <typename scalar_t, int kLocalVHeads>
+void dispatch_layout_prefill_for_heads(
+    cudaStream_t stream,
+    const scalar_t* mixed_qkv_conv,
+    const scalar_t* a,
+    const scalar_t* b,
+    scalar_t* q_rep,
+    scalar_t* k_rep,
+    scalar_t* v,
+    scalar_t* a_kernel,
+    scalar_t* b_kernel,
+    int64_t token_count) {
+  constexpr int kLocalQKHeads = decode::local_qk_heads_from_v_heads(kLocalVHeads);
+  kernel::launch_qwen35_layout_prefill_kernel<scalar_t, kLocalQKHeads, kLocalVHeads>(
+      stream,
+      mixed_qkv_conv,
+      a,
+      b,
+      q_rep,
+      k_rep,
+      v,
+      a_kernel,
+      b_kernel,
+      token_count);
+}
+
+template <typename scalar_t>
+void dispatch_layout_prefill(
+    int64_t local_v_heads,
+    cudaStream_t stream,
+    const scalar_t* mixed_qkv_conv,
+    const scalar_t* a,
+    const scalar_t* b,
+    scalar_t* q_rep,
+    scalar_t* k_rep,
+    scalar_t* v,
+    scalar_t* a_kernel,
+    scalar_t* b_kernel,
+    int64_t token_count) {
+  switch (local_v_heads) {
+    case 48:
+      dispatch_layout_prefill_for_heads<scalar_t, 48>(stream, mixed_qkv_conv, a, b, q_rep, k_rep, v, a_kernel, b_kernel, token_count);
+      break;
+    case 24:
+      dispatch_layout_prefill_for_heads<scalar_t, 24>(stream, mixed_qkv_conv, a, b, q_rep, k_rep, v, a_kernel, b_kernel, token_count);
+      break;
+    case 12:
+      dispatch_layout_prefill_for_heads<scalar_t, 12>(stream, mixed_qkv_conv, a, b, q_rep, k_rep, v, a_kernel, b_kernel, token_count);
+      break;
+    case 6:
+      dispatch_layout_prefill_for_heads<scalar_t, 6>(stream, mixed_qkv_conv, a, b, q_rep, k_rep, v, a_kernel, b_kernel, token_count);
+      break;
+  }
+}
+
 } // namespace
 
 void run_qwen35_layout_prefill(LayoutPrefillParams& params) {
@@ -82,12 +137,16 @@ void run_qwen35_layout_prefill(LayoutPrefillParams& params) {
   check_rank_2(b, "b");
 
   const int64_t token_count = mixed_qkv_conv.size(0);
-  TORCH_CHECK(mixed_qkv_conv.size(1) == kMixedQKVDim, "mixed_qkv_conv must be [N, 10240].");
-  TORCH_CHECK(a.sizes() == at::IntArrayRef({token_count, kNumVHeads}), "a must be [N, 48].");
-  TORCH_CHECK(b.sizes() == at::IntArrayRef({token_count, kNumVHeads}), "b must be [N, 48].");
+  const int64_t local_v_heads = a.size(1);
+  TORCH_CHECK(decode::is_supported_local_v_heads(static_cast<int>(local_v_heads)), "local V heads must be one of {48, 24, 12, 6}, got ", local_v_heads, ".");
+  const int local_qk_heads = decode::local_qk_heads_from_v_heads(static_cast<int>(local_v_heads));
+  const int local_mixed_dim = decode::local_mixed_qkv_dim(local_qk_heads, static_cast<int>(local_v_heads));
+  TORCH_CHECK(mixed_qkv_conv.size(1) == local_mixed_dim, "mixed_qkv_conv must be [N, local_conv_dim=", local_mixed_dim, "].");
+  TORCH_CHECK(a.sizes() == at::IntArrayRef({token_count, local_v_heads}), "a must be [N, local_v_heads].");
+  TORCH_CHECK(b.sizes() == at::IntArrayRef({token_count, local_v_heads}), "b must be [N, local_v_heads].");
   TORCH_CHECK(
-      q_rep.dim() == 3 && q_rep.sizes() == at::IntArrayRef({token_count, kNumVHeads, kHeadDimQK}),
-      "q_rep must be [N, 48, 128].");
+      q_rep.dim() == 3 && q_rep.sizes() == at::IntArrayRef({token_count, local_v_heads, kHeadDimQK}),
+      "q_rep must be [N, local_v_heads, 128].");
   TORCH_CHECK(k_rep.sizes() == q_rep.sizes(), "k_rep must match q_rep shape.");
   TORCH_CHECK(v.sizes() == q_rep.sizes(), "v must match q_rep shape.");
   TORCH_CHECK(a_kernel.sizes() == a.sizes(), "a_kernel must match a shape.");
@@ -97,7 +156,8 @@ void run_qwen35_layout_prefill(LayoutPrefillParams& params) {
   cudaStream_t stream = at::cuda::getDefaultCUDAStream(device.index());
 
   if (mixed_qkv_conv.scalar_type() == at::kHalf) {
-    kernel::launch_qwen35_layout_prefill_kernel<c10::Half>(
+    dispatch_layout_prefill<c10::Half>(
+        local_v_heads,
         stream,
         mixed_qkv_conv.data_ptr<c10::Half>(),
         a.data_ptr<c10::Half>(),
@@ -109,7 +169,8 @@ void run_qwen35_layout_prefill(LayoutPrefillParams& params) {
         b_kernel.data_ptr<c10::Half>(),
         token_count);
   } else {
-    kernel::launch_qwen35_layout_prefill_kernel<c10::BFloat16>(
+    dispatch_layout_prefill<c10::BFloat16>(
+        local_v_heads,
         stream,
         mixed_qkv_conv.data_ptr<c10::BFloat16>(),
         a.data_ptr<c10::BFloat16>(),

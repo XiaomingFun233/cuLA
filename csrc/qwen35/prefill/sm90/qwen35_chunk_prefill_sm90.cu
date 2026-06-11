@@ -160,17 +160,17 @@ void qwen35_chunk_qk_prefill_sm90(at::Tensor q, at::Tensor k, at::Tensor out) {
   TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must be bfloat16");
   TORCH_CHECK(k.scalar_type() == at::kBFloat16, "k must be bfloat16");
   TORCH_CHECK(out.scalar_type() == at::kFloat, "out must be float32");
-  TORCH_CHECK(q.is_contiguous(), "q must be contiguous [B,T,48,128]");
-  TORCH_CHECK(k.is_contiguous(), "k must be contiguous [B,T,48,128]");
-  TORCH_CHECK(out.is_contiguous(), "out must be contiguous [B,48,T,T]");
-  TORCH_CHECK(q.dim() == 4, "q must be [B,T,48,128]");
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous [B,T,HV,128]");
+  TORCH_CHECK(k.is_contiguous(), "k must be contiguous [B,T,HV,128]");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous [B,HV,T,T]");
+  TORCH_CHECK(q.dim() == 4, "q must be [B,T,HV,128]");
   TORCH_CHECK(k.sizes() == q.sizes(), "k must match q");
   const int64_t B = q.size(0);
   const int64_t T = q.size(1);
   const int64_t HV = q.size(2);
-  TORCH_CHECK(HV == kNumVHeads, "expected HV=48");
+  TORCH_CHECK(decode::is_supported_local_v_heads(static_cast<int>(HV)), "expected local HV in {48, 24, 12, 6}, got ", HV);
   TORCH_CHECK(q.size(3) == kHeadDimQK, "expected D=128");
-  TORCH_CHECK(out.sizes() == at::IntArrayRef({B, HV, T, T}), "out must be [B,48,T,T]");
+  TORCH_CHECK(out.sizes() == at::IntArrayRef({B, HV, T, T}), "out must be [B,HV,T,T]");
 
   const at::cuda::OptionalCUDAGuard device_guard(q.device());
   run_qwen35_chunk_qk_prefill_sm90_impl<c10::BFloat16>(q, k, out);

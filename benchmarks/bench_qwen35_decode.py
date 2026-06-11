@@ -51,6 +51,7 @@ sys.path.insert(0, str(ROOT))
 import cula.cudac as cula_cuda
 from cula.ops.kda_decode_fla import fused_sigmoid_gating_delta_rule_update as triton_fused_sigmoid_update
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG as CONFIG
+from cula.qwen35.common import Qwen35LinearAttentionConfig
 from cula.qwen35.runtime import qwen35_linear_attention_decode
 
 SGLANG_CORE_MODULES = [
@@ -134,71 +135,86 @@ def benchmark_accel_fn(
     return statistics.mean(iqr)
 
 
-def make_full_inputs(tokens: int, device: torch.device, seed: int):
+def local_config_from_tp_size(tp_size: int) -> Qwen35LinearAttentionConfig:
+    if tp_size not in (1, 2, 4, 8):
+        raise ValueError(f"tp_size must be one of 1, 2, 4, 8, got {tp_size}")
+    return Qwen35LinearAttentionConfig(
+        hidden_size=CONFIG.hidden_size // tp_size,
+        conv_kernel_size=CONFIG.conv_kernel_size,
+        num_k_heads=CONFIG.num_k_heads // tp_size,
+        num_v_heads=CONFIG.num_v_heads // tp_size,
+        head_k_dim=CONFIG.head_k_dim,
+        head_v_dim=CONFIG.head_v_dim,
+        qkv_dtype=CONFIG.qkv_dtype,
+        state_dtype=CONFIG.state_dtype,
+    )
+
+
+def make_full_inputs(tokens: int, device: torch.device, seed: int, config: Qwen35LinearAttentionConfig):
     torch.manual_seed(seed)
     pool_size = max(tokens, 1)
-    mixed_qkv = torch.randn(tokens, CONFIG.conv_dim, device=device, dtype=CONFIG.qkv_dtype)
-    a = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    b = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    conv_weight = torch.randn(CONFIG.conv_dim, CONFIG.conv_kernel_size, device=device, dtype=CONFIG.qkv_dtype)
+    mixed_qkv = torch.randn(tokens, config.conv_dim, device=device, dtype=config.qkv_dtype)
+    a = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    b = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    conv_weight = torch.randn(config.conv_dim, config.conv_kernel_size, device=device, dtype=config.qkv_dtype)
     conv_state = torch.randn(
         tokens,
-        CONFIG.conv_dim,
-        CONFIG.conv_kernel_size,
+        config.conv_dim,
+        config.conv_kernel_size,
         device=device,
-        dtype=CONFIG.qkv_dtype,
+        dtype=config.qkv_dtype,
     )
     recurrent_state = torch.randn(
         pool_size,
-        CONFIG.num_v_heads,
-        CONFIG.head_k_dim,
-        CONFIG.head_v_dim,
+        config.num_v_heads,
+        config.head_k_dim,
+        config.head_v_dim,
         device=device,
-        dtype=CONFIG.state_dtype,
+        dtype=config.state_dtype,
     ) * 0.01
-    A_log = -torch.rand(CONFIG.num_v_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(CONFIG.num_v_heads, device=device, dtype=torch.float32) * 0.1
+    A_log = -torch.rand(config.num_v_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(config.num_v_heads, device=device, dtype=torch.float32) * 0.1
     state_indices = torch.arange(tokens, device=device, dtype=torch.int32)
     return mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices
 
 
-def make_fused_layout_kda_inputs(tokens: int, device: torch.device, seed: int):
+def make_fused_layout_kda_inputs(tokens: int, device: torch.device, seed: int, config: Qwen35LinearAttentionConfig):
     torch.manual_seed(seed)
-    mixed_qkv_conv = torch.randn(tokens, CONFIG.conv_dim, device=device, dtype=CONFIG.qkv_dtype)
-    a = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    b = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    A_log = -torch.rand(CONFIG.num_v_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(CONFIG.num_v_heads, device=device, dtype=torch.float32) * 0.1
+    mixed_qkv_conv = torch.randn(tokens, config.conv_dim, device=device, dtype=config.qkv_dtype)
+    a = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    b = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    A_log = -torch.rand(config.num_v_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(config.num_v_heads, device=device, dtype=torch.float32) * 0.1
     state = torch.randn(
         tokens,
-        CONFIG.num_v_heads,
-        CONFIG.head_k_dim,
-        CONFIG.head_v_dim,
+        config.num_v_heads,
+        config.head_k_dim,
+        config.head_v_dim,
         device=device,
-        dtype=CONFIG.state_dtype,
+        dtype=config.state_dtype,
     ) * 0.01
     state_work = torch.empty_like(state)
     state_indices = torch.arange(tokens, device=device, dtype=torch.int32)
-    out = torch.empty(tokens, CONFIG.num_v_heads, CONFIG.head_v_dim, device=device, dtype=CONFIG.qkv_dtype)
+    out = torch.empty(tokens, config.num_v_heads, config.head_v_dim, device=device, dtype=config.qkv_dtype)
     return mixed_qkv_conv, a, b, A_log, dt_bias, state, state_work, state_indices, out
 
 
-def make_core_inputs(tokens: int, device: torch.device, seed: int):
+def make_core_inputs(tokens: int, device: torch.device, seed: int, config: Qwen35LinearAttentionConfig):
     torch.manual_seed(seed)
-    q = torch.randn(tokens, CONFIG.num_v_heads, CONFIG.head_k_dim, device=device, dtype=CONFIG.qkv_dtype)
-    k = torch.randn(tokens, CONFIG.num_v_heads, CONFIG.head_k_dim, device=device, dtype=CONFIG.qkv_dtype)
-    v = torch.randn(tokens, CONFIG.num_v_heads, CONFIG.head_v_dim, device=device, dtype=CONFIG.qkv_dtype)
-    a = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    b = torch.randn(tokens, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    A_log = -torch.rand(CONFIG.num_v_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(CONFIG.num_v_heads, device=device, dtype=torch.float32) * 0.1
+    q = torch.randn(tokens, config.num_v_heads, config.head_k_dim, device=device, dtype=config.qkv_dtype)
+    k = torch.randn(tokens, config.num_v_heads, config.head_k_dim, device=device, dtype=config.qkv_dtype)
+    v = torch.randn(tokens, config.num_v_heads, config.head_v_dim, device=device, dtype=config.qkv_dtype)
+    a = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    b = torch.randn(tokens, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    A_log = -torch.rand(config.num_v_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(config.num_v_heads, device=device, dtype=torch.float32) * 0.1
     state = torch.randn(
         tokens,
-        CONFIG.num_v_heads,
-        CONFIG.head_k_dim,
-        CONFIG.head_v_dim,
+        config.num_v_heads,
+        config.head_k_dim,
+        config.head_v_dim,
         device=device,
-        dtype=CONFIG.state_dtype,
+        dtype=config.state_dtype,
     ) * 0.01
     state_indices = torch.arange(tokens, device=device, dtype=torch.int32)
     out = torch.empty_like(v)
@@ -291,8 +307,8 @@ def call_with_supported_kwargs(fn: Callable, **kwargs):
     return fn(**filtered)
 
 
-def bench_native_core(tokens: int, device: torch.device, warmup: int, rep: int, seed: int) -> float:
-    q, k, v, a, b, A_log, dt_bias, state, state_work, state_indices, out = make_core_inputs(tokens, device, seed)
+def bench_native_core(tokens: int, device: torch.device, warmup: int, rep: int, seed: int, config: Qwen35LinearAttentionConfig) -> float:
+    q, k, v, a, b, A_log, dt_bias, state, state_work, state_indices, out = make_core_inputs(tokens, device, seed, config)
 
     def setup() -> None:
         state_work.copy_(state)
@@ -314,8 +330,8 @@ def bench_native_core(tokens: int, device: torch.device, warmup: int, rep: int, 
     return benchmark_accel_fn(run, device=device, setup_fn=setup, warmup=warmup, rep=rep)
 
 
-def bench_triton_core(tokens: int, device: torch.device, warmup: int, rep: int, seed: int) -> float:
-    q, k, v, a, b, A_log, dt_bias, state, state_work, state_indices, _ = make_core_inputs(tokens, device, seed)
+def bench_triton_core(tokens: int, device: torch.device, warmup: int, rep: int, seed: int, config: Qwen35LinearAttentionConfig) -> float:
+    q, k, v, a, b, A_log, dt_bias, state, state_work, state_indices, _ = make_core_inputs(tokens, device, seed, config)
     q_4d = q.unsqueeze(1).contiguous()
     k_4d = k.unsqueeze(1).contiguous()
     v_4d = v.unsqueeze(1).contiguous()
@@ -338,7 +354,7 @@ def bench_triton_core(tokens: int, device: torch.device, warmup: int, rep: int, 
             b=b_3d,
             initial_state_source=state_work,
             initial_state_indices=state_indices,
-            scale=CONFIG.head_k_dim**-0.5,
+            scale=config.head_k_dim**-0.5,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=None,
             is_kda=False,
@@ -347,9 +363,9 @@ def bench_triton_core(tokens: int, device: torch.device, warmup: int, rep: int, 
     return benchmark_accel_fn(run, device=device, setup_fn=setup, warmup=warmup, rep=rep)
 
 
-def bench_fused_layout_kda(tokens: int, device: torch.device, warmup: int, rep: int, seed: int) -> float:
+def bench_fused_layout_kda(tokens: int, device: torch.device, warmup: int, rep: int, seed: int, config: Qwen35LinearAttentionConfig) -> float:
     mixed_qkv_conv, a, b, A_log, dt_bias, state, state_work, state_indices, out = make_fused_layout_kda_inputs(
-        tokens, device, seed
+        tokens, device, seed, config
     )
 
     def setup() -> None:
@@ -377,8 +393,9 @@ def bench_sglang_core(
     rep: int,
     seed: int,
     sglang_fused_update: Callable,
+    config: Qwen35LinearAttentionConfig,
 ) -> float:
-    q, k, v, a, b, A_log, dt_bias, state, _, state_indices, _ = make_core_inputs(tokens, device, seed)
+    q, k, v, a, b, A_log, dt_bias, state, _, state_indices, _ = make_core_inputs(tokens, device, seed, config)
     q_4d = q.unsqueeze(1).contiguous()
     k_4d = k.unsqueeze(1).contiguous()
     v_4d = v.unsqueeze(1).contiguous()
@@ -404,7 +421,7 @@ def bench_sglang_core(
             b=b_3d,
             initial_state_source=state_vk_work,
             initial_state_indices=state_indices,
-            scale=CONFIG.head_k_dim**-0.5,
+            scale=config.head_k_dim**-0.5,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=None,
             is_kda=False,
@@ -420,11 +437,12 @@ def bench_sglang_packed_layout_kda(
     rep: int,
     seed: int,
     sglang_packed_decode: Callable,
+    config: Qwen35LinearAttentionConfig,
 ) -> float:
-    mixed_qkv_conv, a, b, A_log, dt_bias, state, _, state_indices, _ = make_fused_layout_kda_inputs(tokens, device, seed)
+    mixed_qkv_conv, a, b, A_log, dt_bias, state, _, state_indices, _ = make_fused_layout_kda_inputs(tokens, device, seed, config)
     state_vk = state.transpose(-1, -2).contiguous()
     state_vk_work = torch.empty_like(state_vk)
-    out = torch.empty(tokens, 1, CONFIG.num_v_heads, CONFIG.head_v_dim, device=device, dtype=CONFIG.qkv_dtype)
+    out = torch.empty(tokens, 1, config.num_v_heads, config.head_v_dim, device=device, dtype=config.qkv_dtype)
 
     def setup() -> None:
         state_vk_work.copy_(state_vk)
@@ -437,7 +455,7 @@ def bench_sglang_packed_layout_kda(
             b=b,
             A_log=A_log,
             dt_bias=dt_bias,
-            scale=CONFIG.head_k_dim**-0.5,
+            scale=config.head_k_dim**-0.5,
             initial_state=state_vk_work,
             out=out,
             ssm_state_indices=state_indices,
@@ -447,8 +465,8 @@ def bench_sglang_packed_layout_kda(
     return benchmark_accel_fn(run, device=device, setup_fn=setup, warmup=warmup, rep=rep)
 
 
-def bench_full(tokens: int, device: torch.device, warmup: int, rep: int, seed: int) -> float:
-    inputs = make_full_inputs(tokens, device, seed)
+def bench_full(tokens: int, device: torch.device, warmup: int, rep: int, seed: int, config: Qwen35LinearAttentionConfig) -> float:
+    inputs = make_full_inputs(tokens, device, seed, config)
     mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices = inputs
     conv_state_work = torch.empty_like(conv_state)
     recurrent_state_work = torch.empty_like(recurrent_state)
@@ -465,6 +483,7 @@ def bench_full(tokens: int, device: torch.device, warmup: int, rep: int, seed: i
             conv_weight,
             A_log,
             dt_bias,
+            config=config,
             conv_state=conv_state_work,
             recurrent_state=recurrent_state_work,
             state_indices=state_indices,
@@ -481,6 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scope", choices=["core", "fused", "full", "both"], default="both")
+    parser.add_argument("--tp-size", type=int, choices=[1, 2, 4, 8], default=1)
     parser.add_argument("--skip-triton", action="store_true", help="Skip the vendored Triton core timing.")
     parser.add_argument("--skip-sglang", action="store_true", help="Do not try the SGLang kernel provider.")
     parser.add_argument("--require-sglang", action="store_true", help="Fail if the SGLang kernel provider is unavailable.")
@@ -491,6 +511,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    config = local_config_from_tp_size(args.tp_size)
     device = accelerator_device()
     rows: list[dict[str, object]] = []
     sglang_fused_update = None
@@ -504,7 +525,10 @@ def main() -> int:
         raise RuntimeError("SGLang core and packed decode providers must both be available.")
 
     print(f"device={device} name={accelerator_name(device)} torch={torch.__version__}")
-    print(f"qwen35: HV={CONFIG.num_v_heads} K={CONFIG.head_k_dim} V={CONFIG.head_v_dim} conv_dim={CONFIG.conv_dim}")
+    print(
+        f"qwen35: tp={args.tp_size} local_HK={config.num_k_heads} local_HV={config.num_v_heads} "
+        f"K={config.head_k_dim} V={config.head_v_dim} conv_dim={config.conv_dim}"
+    )
     print(f"sglang_core_provider={sglang_core_source or 'unavailable'}")
     print(f"sglang_packed_provider={sglang_packed_source or 'unavailable'}")
     print("| tokens | native_core_ms | triton_core_ms | sglang_core_ms | fused_layout_kda_ms | sglang_packed_ms | full_ms | triton/native | sglang/native | packed/fused | native_us_per_token | triton_us_per_token | sglang_us_per_token | fused_us_per_token | packed_us_per_token | full_us_per_token |")
@@ -518,9 +542,9 @@ def main() -> int:
         sglang_packed_ms = None
         full_ms = None
         if args.scope in ("core", "both"):
-            native_core_ms = bench_native_core(tokens, device, args.warmup, args.rep, args.seed)
+            native_core_ms = bench_native_core(tokens, device, args.warmup, args.rep, args.seed, config)
             if not args.skip_triton:
-                triton_core_ms = bench_triton_core(tokens, device, args.warmup, args.rep, args.seed)
+                triton_core_ms = bench_triton_core(tokens, device, args.warmup, args.rep, args.seed, config)
             if sglang_fused_update is not None:
                 sglang_core_ms = bench_sglang_core(
                     tokens,
@@ -529,9 +553,10 @@ def main() -> int:
                     args.rep,
                     args.seed,
                     sglang_fused_update,
+                    config,
                 )
         if args.scope in ("fused", "both"):
-            fused_layout_kda_ms = bench_fused_layout_kda(tokens, device, args.warmup, args.rep, args.seed)
+            fused_layout_kda_ms = bench_fused_layout_kda(tokens, device, args.warmup, args.rep, args.seed, config)
             if sglang_packed_decode is not None:
                 sglang_packed_ms = bench_sglang_packed_layout_kda(
                     tokens,
@@ -540,9 +565,10 @@ def main() -> int:
                     args.rep,
                     args.seed,
                     sglang_packed_decode,
+                    config,
                 )
         if args.scope in ("full", "both"):
-            full_ms = bench_full(tokens, device, args.warmup, args.rep, args.seed)
+            full_ms = bench_full(tokens, device, args.warmup, args.rep, args.seed, config)
 
         native_core_us = None if native_core_ms is None else native_core_ms * 1000.0 / tokens
         triton_core_us = None if triton_core_ms is None else triton_core_ms * 1000.0 / tokens
@@ -580,6 +606,10 @@ def main() -> int:
         rows.append(
             {
                 "tokens": tokens,
+                "tp_size": args.tp_size,
+                "local_k_heads": config.num_k_heads,
+                "local_v_heads": config.num_v_heads,
+                "conv_dim": config.conv_dim,
                 "native_core_ms": native_core_ms,
                 "triton_core_ms": triton_core_ms,
                 "sglang_core_ms": sglang_core_ms,
@@ -605,6 +635,10 @@ def main() -> int:
                 f,
                 fieldnames=[
                     "tokens",
+                    "tp_size",
+                    "local_k_heads",
+                    "local_v_heads",
+                    "conv_dim",
                     "native_core_ms",
                     "triton_core_ms",
                     "sglang_core_ms",

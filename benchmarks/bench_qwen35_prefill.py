@@ -27,8 +27,8 @@ delta rule family in its Triton GDN kernel; decode uses a recurrent packed
 kernel instead.
 
 Note: cula_qk currently benchmarks the TMA tensor-core Q @ K^T subpath only,
-not the full gated-delta prefill recurrence. Its output is [B,48,T,T], so long
-sequence lengths have quadratic memory cost.
+not the full gated-delta prefill recurrence. Its output is [B,local_HV,T,T],
+so long sequence lengths have quadratic memory cost.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ from cula.ops.qwen35_layout_prefill import qwen35_layout_prefill
 from cula.ops.qwen35_fused_kda_prefill import qwen35_fused_kda_prefill
 from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG as CONFIG
+from cula.qwen35.common import Qwen35LinearAttentionConfig
 from cula.utils import get_kda_fused_fwd
 
 try:
@@ -117,30 +118,45 @@ def resolve_sgl_chunk_gdr(sglang_path: pathlib.Path | None):
     return module.chunk_gated_delta_rule, "sglang.srt.layers.attention.fla.chunk.chunk_gated_delta_rule"
 
 
-def make_inputs(batch: int, seq_len: int, *, device: torch.device, seed: int):
+def local_config_from_tp_size(tp_size: int) -> Qwen35LinearAttentionConfig:
+    if tp_size not in (1, 2, 4, 8):
+        raise ValueError(f"tp_size must be one of 1, 2, 4, 8, got {tp_size}")
+    return Qwen35LinearAttentionConfig(
+        hidden_size=CONFIG.hidden_size // tp_size,
+        conv_kernel_size=CONFIG.conv_kernel_size,
+        num_k_heads=CONFIG.num_k_heads // tp_size,
+        num_v_heads=CONFIG.num_v_heads // tp_size,
+        head_k_dim=CONFIG.head_k_dim,
+        head_v_dim=CONFIG.head_v_dim,
+        qkv_dtype=CONFIG.qkv_dtype,
+        state_dtype=CONFIG.state_dtype,
+    )
+
+
+def make_inputs(batch: int, seq_len: int, *, device: torch.device, seed: int, config: Qwen35LinearAttentionConfig):
     torch.manual_seed(seed)
-    q = torch.randn(batch, seq_len, CONFIG.num_v_heads, CONFIG.head_k_dim, device=device, dtype=CONFIG.qkv_dtype)
+    q = torch.randn(batch, seq_len, config.num_v_heads, config.head_k_dim, device=device, dtype=config.qkv_dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    a = torch.randn(batch, seq_len, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    b = torch.randn(batch, seq_len, CONFIG.num_v_heads, device=device, dtype=CONFIG.qkv_dtype)
-    beta = torch.sigmoid(b.float()).to(dtype=CONFIG.qkv_dtype)
-    A_log = -torch.rand(CONFIG.num_v_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(CONFIG.num_v_heads, device=device, dtype=torch.float32) * 0.1
+    a = torch.randn(batch, seq_len, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    b = torch.randn(batch, seq_len, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    beta = torch.sigmoid(b.float()).to(dtype=config.qkv_dtype)
+    A_log = -torch.rand(config.num_v_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(config.num_v_heads, device=device, dtype=torch.float32) * 0.1
     log_gate = (-torch.exp(A_log).view(1, 1, -1) * torch.nn.functional.softplus(a.float() + dt_bias.view(1, 1, -1))).to(
-        dtype=CONFIG.qkv_dtype
+        dtype=config.qkv_dtype
     )
     initial_state = torch.randn(
         batch,
-        CONFIG.num_v_heads,
-        CONFIG.head_k_dim,
-        CONFIG.head_v_dim,
+        config.num_v_heads,
+        config.head_k_dim,
+        config.head_v_dim,
         device=device,
         dtype=torch.float32,
     ) * 0.01
-    mixed_qkv_conv = torch.randn(batch * seq_len, CONFIG.conv_dim, device=device, dtype=CONFIG.qkv_dtype)
-    a_flat = a.reshape(batch * seq_len, CONFIG.num_v_heads).contiguous()
-    b_flat = b.reshape(batch * seq_len, CONFIG.num_v_heads).contiguous()
+    mixed_qkv_conv = torch.randn(batch * seq_len, config.conv_dim, device=device, dtype=config.qkv_dtype)
+    a_flat = a.reshape(batch * seq_len, config.num_v_heads).contiguous()
+    b_flat = b.reshape(batch * seq_len, config.num_v_heads).contiguous()
     return q, k, v, a, b, beta, log_gate, A_log, dt_bias, initial_state, mixed_qkv_conv, a_flat, b_flat
 
 
@@ -195,7 +211,7 @@ def prepare_cula_fused_core_inputs(q, k, a, b, A_log, dt_bias, initial_state):
     return q_norm, k_norm, log_gate_cumsum, beta, initial_state_vk
 
 
-def run_cula_fused_core(q_norm, k_norm, v, log_gate_cumsum, beta, initial_state_vk):
+def run_cula_fused_core(q_norm, k_norm, v, log_gate_cumsum, beta, initial_state_vk, config: Qwen35LinearAttentionConfig):
     fused_kda_prefill = get_kda_fused_fwd(q_norm.device)
     return fused_kda_prefill(
         q=q_norm,
@@ -203,7 +219,7 @@ def run_cula_fused_core(q_norm, k_norm, v, log_gate_cumsum, beta, initial_state_
         v=v.contiguous(),
         g=log_gate_cumsum,
         beta=beta,
-        scale=CONFIG.head_k_dim**-0.5,
+        scale=config.head_k_dim**-0.5,
         initial_state=initial_state_vk,
         output_final_state=True,
         use_qk_l2norm_in_kernel=False,
@@ -213,7 +229,7 @@ def run_cula_fused_core(q_norm, k_norm, v, log_gate_cumsum, beta, initial_state_
     )
 
 
-def run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_state_indices):
+def run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_state_indices, config: Qwen35LinearAttentionConfig):
     # SGLang/FLA GDR chunk kernels use [N, H, V, K] state layout. cuLA's
     # Qwen3.5 wrapper uses [N, H, K, V], so pass the transposed view here.
     initial_state_vk = initial_state.transpose(-1, -2).contiguous()
@@ -226,7 +242,7 @@ def run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_sta
         initial_state=initial_state_vk,
         initial_state_indices=initial_state_indices,
         output_final_state=True,
-        scale=CONFIG.head_k_dim**-0.5,
+        scale=config.head_k_dim**-0.5,
         use_qk_l2norm_in_kernel=True,
         head_first=False,
     )
@@ -253,10 +269,15 @@ def _state_to_cula_layout(state: torch.Tensor | None) -> torch.Tensor | None:
 
 
 def print_header(device: torch.device, args: argparse.Namespace, baseline_sources: dict[str, str]) -> None:
+    config = local_config_from_tp_size(args.tp_size)
     print("Qwen3.5 prefill benchmark")
     print(f"  device: {torch.cuda.get_device_name(device)}")
-    print(f"  dtype: {CONFIG.qkv_dtype}")
+    print(f"  dtype: {config.qkv_dtype}")
     print(f"  batch: {args.batch}")
+    print(
+        f"  tp/local config: tp={args.tp_size} local_k_heads={config.num_k_heads} "
+        f"local_v_heads={config.num_v_heads} conv_dim={config.conv_dim}"
+    )
     print(f"  seq lens: {args.seq_lens}")
     print(f"  warmup/rep: {args.warmup}/{args.rep}")
     print(f"  baselines: {baseline_sources or 'disabled/unavailable'}")
@@ -284,6 +305,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp-size", type=int, choices=[1, 2, 4, 8], default=1)
     parser.add_argument("--baseline", choices=["none", "fla", "sgl", "all"], default="sgl")
     parser.add_argument("--sglang-path", type=pathlib.Path, default=None)
     parser.add_argument(
@@ -297,9 +319,10 @@ def main() -> None:
         "--max-qk-elements",
         type=int,
         default=512 * 1024 * 1024,
-        help="Skip cuLA QK timings when B*48*T*T exceeds this element count.",
+        help="Skip cuLA QK timings when B*local_HV*T*T exceeds this element count.",
     )
     args = parser.parse_args()
+    config = local_config_from_tp_size(args.tp_size)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
@@ -330,18 +353,19 @@ def main() -> None:
             seq_len,
             device=device,
             seed=args.seed,
+            config=config,
         )
         initial_state_indices = torch.arange(args.batch, device=device, dtype=torch.int32)
 
         def layout_fn():
             return qwen35_layout_prefill(mixed_qkv_conv, a_flat, b_flat, backend="cudac")
 
-        qk_elements = args.batch * CONFIG.num_v_heads * seq_len * seq_len
+        qk_elements = args.batch * config.num_v_heads * seq_len * seq_len
         qk_out = None
         if args.cula_mode == "qk" and qk_elements <= args.max_qk_elements:
             qk_out = torch.empty(
                 args.batch,
-                CONFIG.num_v_heads,
+                config.num_v_heads,
                 seq_len,
                 seq_len,
                 device=device,
@@ -357,7 +381,7 @@ def main() -> None:
             if args.cula_mode == "fused":
                 return run_cula_fused(q, k, v, a, b, A_log, dt_bias, initial_state)
             if args.cula_mode == "fused-core":
-                return run_cula_fused_core(*fused_core_inputs[:2], v, *fused_core_inputs[2:])
+                return run_cula_fused_core(*fused_core_inputs[:2], v, *fused_core_inputs[2:], config)
             if qk_out is None:
                 raise RuntimeError(
                     f"Skipping cuLA QK: B*H*T*T={qk_elements} exceeds --max-qk-elements={args.max_qk_elements}"
@@ -394,7 +418,7 @@ def main() -> None:
 
         for baseline_name, chunk_gdr in baselines.items():
             def baseline_fn():
-                return run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_state_indices)
+                return run_chunk_gdr(chunk_gdr, q, k, v, log_gate, beta, initial_state, initial_state_indices, config)
 
             row_rel_rms = rel_rms
             row_rel_max = rel_max
