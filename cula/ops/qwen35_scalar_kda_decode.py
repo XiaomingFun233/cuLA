@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import torch
 
+from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG, Qwen35LinearAttentionConfig
+
 try:
     import cula.cudac as cula_cuda
 except ImportError:
@@ -146,6 +148,7 @@ def qwen35_layout_scalar_kda_decode(
     recurrent_state: torch.Tensor,
     *,
     state_indices: torch.Tensor | None = None,
+    config: Qwen35LinearAttentionConfig = DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
     backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Qwen3.5 layout decode + scalar-gated KDA decode."""
@@ -209,7 +212,7 @@ def qwen35_layout_scalar_kda_decode(
 
     from cula.ops.qwen35_layout_decode import qwen35_layout_decode_reference
 
-    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode_reference(mixed_qkv_conv, a, b)
+    q_rep, k_rep, v, a_kernel, b_kernel = qwen35_layout_decode_reference(mixed_qkv_conv, a, b, config=config)
     return qwen35_scalar_kda_decode(
         q=q_rep.unsqueeze(1).contiguous(),
         k=k_rep.unsqueeze(1).contiguous(),

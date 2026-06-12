@@ -42,8 +42,8 @@ void dispatch_scalar_decode_for_heads(
     const int32_t* pool_idx,
     scalar_t* out,
     int token_count) {
-  constexpr int kLocalQKHeads = local_qk_heads_from_v_heads(kLocalVHeads);
-  kernel::launch_qwen35_scalar_kda_decode_kernel<scalar_t, kLocalQKHeads, kLocalVHeads>(
+  using Shape = Qwen35DecodeLocalShape<kLocalVHeads>;
+  kernel::launch_qwen35_scalar_kda_decode_kernel<scalar_t, Shape::kLocalQKHeads, Shape::kLocalVHeads>(
       stream,
       q_rep,
       k_rep,
@@ -70,8 +70,8 @@ void dispatch_layout_scalar_decode_for_heads(
     const int32_t* pool_idx,
     scalar_t* out,
     int token_count) {
-  constexpr int kLocalQKHeads = local_qk_heads_from_v_heads(kLocalVHeads);
-  kernel::launch_qwen35_layout_scalar_kda_decode_kernel<scalar_t, kLocalQKHeads, kLocalVHeads>(
+  using Shape = Qwen35DecodeLocalShape<kLocalVHeads>;
+  kernel::launch_qwen35_layout_scalar_kda_decode_kernel<scalar_t, Shape::kLocalQKHeads, Shape::kLocalVHeads>(
       stream,
       mixed_qkv_conv,
       a,

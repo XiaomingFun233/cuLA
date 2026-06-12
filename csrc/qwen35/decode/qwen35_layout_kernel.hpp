@@ -56,17 +56,18 @@ __global__ void qwen35_layout_decode_kernel_cute(
     scalar_t* __restrict__ a_kernel,
     scalar_t* __restrict__ b_kernel,
     int64_t token_count) {
-  static_assert(kLocalVHeads % kLocalQKHeads == 0);
-  constexpr int kRepeatFactor = kLocalVHeads / kLocalQKHeads;
-  constexpr int kLocalQDim = kLocalQKHeads * kHeadDimQK;
-  constexpr int kLocalKDim = kLocalQKHeads * kHeadDimQK;
-  constexpr int kLocalMixedQKVDim = 2 * kLocalQDim + kLocalVHeads * kHeadDimV;
+  using Shape = Qwen35DecodeLocalShape<kLocalVHeads>;
+  static_assert(kLocalQKHeads == Shape::kLocalQKHeads);
+  constexpr int kRepeatFactor = Shape::kRepeatFactor;
+  constexpr int kLocalQDim = Shape::kLocalQDim;
+  constexpr int kLocalKDim = Shape::kLocalKDim;
+  constexpr int kLocalMixedQKVDim = Shape::kLocalMixedQKVDim;
   // TODO(qwen35-layout-opt):
   // - Re-evaluate whether Vec=8 is profitable for bf16/fp16 on the target GPUs.
   // - Push more of the q/k repeat mapping into compile-time CuTe layout transforms.
   // - Revisit whether a shared-memory staging path is worthwhile after profiling.
   // - Consider widening the a/b writeback path if it shows up in profiling.
-  constexpr int kVec = 4;
+  constexpr int kVec = Shape::kLayoutVec;
   static_assert(kHeadDimV % kVec == 0);
   static_assert(kHeadDimQK == kHeadDimV);
   static_assert(kHeadDimQK % kVec == 0);

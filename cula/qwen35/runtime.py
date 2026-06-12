@@ -335,6 +335,7 @@ def qwen35_linear_attention_decode(
             dt_bias=dt_bias,
             recurrent_state=recurrent_state,
             state_indices=state_indices,
+            config=config,
             backend=backend,
         )
         core_attn_out = core_attn_out.reshape(tokens, local_value_dim)

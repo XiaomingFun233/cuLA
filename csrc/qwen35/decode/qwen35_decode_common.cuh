@@ -50,6 +50,33 @@ inline constexpr bool is_supported_local_v_heads(int local_v_heads) {
   return local_v_heads == 48 || local_v_heads == 24 || local_v_heads == 12 || local_v_heads == 6;
 }
 
+template <int kLocalVHeads_>
+struct Qwen35DecodeLocalShape {
+  static_assert(is_supported_local_v_heads(kLocalVHeads_), "Unsupported Qwen3.5 local V-head count.");
+  static constexpr int kLocalVHeads = kLocalVHeads_;
+  static constexpr int kLocalQKHeads = local_qk_heads_from_v_heads(kLocalVHeads);
+  static constexpr int kRepeatFactor = kLocalVHeads / kLocalQKHeads;
+  static constexpr int kLocalQDim = local_q_dim(kLocalQKHeads);
+  static constexpr int kLocalKDim = local_q_dim(kLocalQKHeads);
+  static constexpr int kLocalVDim = local_v_dim(kLocalVHeads);
+  static constexpr int kLocalMixedQKVDim = local_mixed_qkv_dim(kLocalQKHeads, kLocalVHeads);
+
+  // Decode shape policy. Head dimension is fixed at 128 for Qwen3.5, but keep
+  // these knobs with the local-head traits so future TP-shape tuning has one
+  // place to specialize.
+  static constexpr int kLayoutVec = 4;
+  static constexpr int kLayoutThreads = kHeadDimQK / kLayoutVec;
+  static constexpr int kKdaThreads = 128;
+  static constexpr int kKdaTileV = 16;
+  static constexpr int kKdaTileK = 16;
+
+  static_assert(kLocalVHeads % kLocalQKHeads == 0);
+  static_assert(kHeadDimQK == kHeadDimV);
+  static_assert(kHeadDimQK % kLayoutVec == 0);
+  static_assert(kHeadDimV % kKdaTileV == 0);
+  static_assert(kHeadDimQK % kKdaTileK == 0);
+};
+
 struct ConvDecodeParams {
   at::Tensor mixed_qkv;   // [B, 1, local_conv_dim]
   at::Tensor conv_state;  // [B, local_conv_dim, 4]

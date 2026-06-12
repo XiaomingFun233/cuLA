@@ -25,6 +25,8 @@ using namespace cute;
 
 template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
 struct Qwen35ScalarKdaDecodeKernel {
+  using Shape = cula::qwen35::decode::Qwen35DecodeLocalShape<kLocalVHeads>;
+  static_assert(kLocalQKHeads == Shape::kLocalQKHeads);
   // Decode-first design:
   // - 1 CTA owns 1 (token_idx, hv)
   // - 1 warpgroup (128 threads) per CTA
@@ -32,10 +34,10 @@ struct Qwen35ScalarKdaDecodeKernel {
   //   internal [V, K] view
   // - the intended optimized path is fp32 FFMA on CUDA cores, not a forced
   //   Tensor Core lowering
-  static constexpr int kThreads = 128;
-  static constexpr int kWarpGroupThreads = 128;
-  static constexpr int kTileV = 16;
-  static constexpr int kTileK = 16;
+  static constexpr int kThreads = Shape::kKdaThreads;
+  static constexpr int kWarpGroupThreads = Shape::kKdaThreads;
+  static constexpr int kTileV = Shape::kKdaTileV;
+  static constexpr int kTileK = Shape::kKdaTileK;
   static constexpr int kTilesPerV = kHeadDimV / kTileV;
   static constexpr int kTilesPerK = kHeadDimQK / kTileK;
 
@@ -65,7 +67,7 @@ struct Qwen35ScalarKdaDecodeKernel {
 
   static dim3 grid_shape(int token_count) {
     // One block owns one (token_idx, hv) pair in the first implementation.
-    return dim3(static_cast<unsigned int>(kLocalVHeads), static_cast<unsigned int>(token_count), 1);
+    return dim3(static_cast<unsigned int>(Shape::kLocalVHeads), static_cast<unsigned int>(token_count), 1);
   }
 
   template <typename Mainloop>
@@ -197,10 +199,10 @@ struct Qwen35ScalarKdaDecodeKernel {
       scalar_t* __restrict__ out,
       int token_count,
       SharedStorage& storage) {
-    constexpr int kRepeatFactor = kLocalVHeads / kLocalQKHeads;
-    constexpr int kLocalQDim = kLocalQKHeads * kHeadDimQK;
-    constexpr int kLocalKDim = kLocalQKHeads * kHeadDimQK;
-    constexpr int kLocalMixedQKVDim = 2 * kLocalQDim + kLocalVHeads * kHeadDimV;
+    constexpr int kRepeatFactor = Shape::kRepeatFactor;
+    constexpr int kLocalQDim = Shape::kLocalQDim;
+    constexpr int kLocalKDim = Shape::kLocalKDim;
+    constexpr int kLocalMixedQKVDim = Shape::kLocalMixedQKVDim;
 
     const int hv = static_cast<int>(blockIdx.x);
     const int token_idx = static_cast<int>(blockIdx.y);

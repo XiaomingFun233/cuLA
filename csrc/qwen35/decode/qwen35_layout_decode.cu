@@ -49,11 +49,10 @@ void launch_layout_decode_for_heads(
     scalar_t* a_kernel,
     scalar_t* b_kernel,
     int64_t batch_size) {
-  constexpr int kLocalQKHeads = cula::qwen35::decode::local_qk_heads_from_v_heads(kLocalVHeads);
-  constexpr int threads = 32;
-  dim3 grid(kLocalVHeads, static_cast<unsigned int>(batch_size), 1);
-  cula::qwen35::decode::qwen35_layout_decode_kernel_cute<scalar_t, kLocalQKHeads, kLocalVHeads>
-      <<<grid, threads, 0, stream>>>(
+  using Shape = cula::qwen35::decode::Qwen35DecodeLocalShape<kLocalVHeads>;
+  dim3 grid(Shape::kLocalVHeads, static_cast<unsigned int>(batch_size), 1);
+  cula::qwen35::decode::qwen35_layout_decode_kernel_cute<scalar_t, Shape::kLocalQKHeads, Shape::kLocalVHeads>
+      <<<grid, Shape::kLayoutThreads, 0, stream>>>(
           mixed_qkv_conv,
           a,
           b,

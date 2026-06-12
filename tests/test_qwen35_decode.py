@@ -106,8 +106,9 @@ def manual_qwen35_decode_reference(
     conv_state: torch.Tensor,
     recurrent_state: torch.Tensor,
     state_indices: torch.Tensor,
+    *,
+    config: Qwen35LinearAttentionConfig = DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
 ):
-    config = DEFAULT_QWEN35_LINEAR_ATTN_CONFIG
     conv_out, conv_state_out = manual_conv_decode(mixed_qkv, conv_state, conv_weight)
     q_end = config.key_dim
     k_end = q_end + config.key_dim
@@ -140,6 +141,45 @@ def manual_qwen35_decode_reference(
             state_out[pool_idx, hv] = state_new_kv
         out[token_idx] = torch.cat(per_token, dim=0)
     return out, conv_state_out, state_out
+
+
+def manual_qwen35_scalar_kda_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+):
+    if a.ndim == 2:
+        a = a.unsqueeze(1)
+    if b.ndim == 2:
+        b = b.unsqueeze(1)
+    N, _, HV, K = q.shape
+    scale = K**-0.5
+    q_f = torch.nn.functional.normalize(q.squeeze(1).float(), dim=-1) * scale
+    k_f = torch.nn.functional.normalize(k.squeeze(1).float(), dim=-1)
+    v_f = v.squeeze(1).float()
+    state_out = recurrent_state.clone()
+    out = torch.empty(N, 1, HV, v.shape[-1], device=q.device, dtype=v.dtype)
+
+    for token_idx in range(N):
+        pool_idx = int(state_indices[token_idx].item())
+        for hv in range(HV):
+            state_kv = state_out[pool_idx, hv]
+            decay = torch.exp(-torch.exp(A_log[hv]) * torch.nn.functional.softplus(a[token_idx, 0, hv].float() + dt_bias[hv]))
+            beta = torch.sigmoid(b[token_idx, 0, hv].float())
+            k_vec = k_f[token_idx, hv]
+            q_vec = q_f[token_idx, hv]
+            proj = decay * (state_kv.transpose(0, 1) @ k_vec)
+            v_new = beta * (v_f[token_idx, hv] - proj)
+            state_new_kv = decay * state_kv + k_vec.unsqueeze(1) * v_new.unsqueeze(0)
+            out[token_idx, 0, hv] = (state_new_kv.transpose(0, 1) @ q_vec).to(v.dtype)
+            state_out[pool_idx, hv] = state_new_kv
+    return out, state_out
 
 
 def manual_qwen35_layout_scalar_kda_reference(
@@ -284,6 +324,130 @@ def test_qwen35_decode_cudac_matches_reference(tokens: int):
     assert torch.allclose(recurrent_state_ref, recurrent_state_out, atol=3e-5, rtol=3e-5)
 
 
+@pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_conv_decode_cudac_supports_local_tp_shapes(local_v_heads: int):
+    config = _local_config(local_v_heads)
+    mixed_qkv, _, _, conv_weight, conv_state, _, _, _, _ = make_inputs(
+        tokens=3,
+        pool_size=3,
+        device=torch.device("cuda"),
+        config=config,
+    )
+    y_ref, state_ref = qwen35_conv1d_decode_update(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        backend="reference",
+    )
+    y, state = qwen35_conv1d_decode_update(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, y_ref)
+    torch.testing.assert_close(state, state_ref)
+
+
+@pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_scalar_kda_decode_cudac_supports_local_tp_shapes(local_v_heads: int):
+    torch.manual_seed(3)
+    config = _local_config(local_v_heads)
+    tokens = 3
+    device = torch.device("cuda")
+    q = torch.randn(tokens, 1, config.num_v_heads, config.head_k_dim, device=device, dtype=config.qkv_dtype)
+    k = torch.randn_like(q)
+    v = torch.randn(tokens, 1, config.num_v_heads, config.head_v_dim, device=device, dtype=config.qkv_dtype)
+    a = torch.randn(tokens, 1, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    b = torch.randn(tokens, 1, config.num_v_heads, device=device, dtype=config.qkv_dtype)
+    A_log = -torch.rand(config.num_v_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(config.num_v_heads, device=device, dtype=torch.float32) * 0.1
+    recurrent_state = torch.randn(
+        tokens,
+        config.num_v_heads,
+        config.head_k_dim,
+        config.head_v_dim,
+        device=device,
+        dtype=config.state_dtype,
+    ) * 0.01
+    state_indices = torch.arange(tokens, device=device, dtype=torch.int32)
+
+    out_ref, state_ref = manual_qwen35_scalar_kda_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+    )
+    out, state = qwen35_scalar_kda_decode(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        state_indices=state_indices,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(state, state_ref, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
+@pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
+def test_qwen35_decode_cudac_supports_local_tp_shapes(local_v_heads: int):
+    config = _local_config(local_v_heads)
+    mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices = make_inputs(
+        tokens=3,
+        pool_size=3,
+        device=torch.device("cuda"),
+        config=config,
+    )
+    out_ref, conv_state_ref, recurrent_state_ref = qwen35_linear_attention_decode(
+        mixed_qkv,
+        a,
+        b,
+        conv_weight,
+        A_log,
+        dt_bias,
+        config=config,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        backend="reference",
+    )
+    out, conv_state_out, recurrent_state_out = qwen35_linear_attention_decode(
+        mixed_qkv,
+        a,
+        b,
+        conv_weight,
+        A_log,
+        dt_bias,
+        config=config,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), out_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(conv_state_out, conv_state_ref)
+    torch.testing.assert_close(recurrent_state_out, recurrent_state_ref, atol=3e-5, rtol=3e-5)
+
+
 @pytest.mark.skipif(not _has_qwen35_fused_layout_kda_cudac(), reason="Qwen3.5 fused layout+KDA CUDA backend is not available")
 @pytest.mark.parametrize("tokens", [1, 2, 4])
 def test_qwen35_fused_layout_kda_cudac_matches_reference_unfused_and_triton(tokens: int):
@@ -348,6 +512,7 @@ def test_qwen35_fused_layout_kda_cudac_matches_reference_unfused_and_triton(toke
         dt_bias=dt_bias,
         recurrent_state=recurrent_state,
         state_indices=state_indices,
+        config=DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
         backend="cudac",
     )
 
@@ -391,6 +556,18 @@ def test_qwen35_layout_scalar_kda_cudac_supports_local_tp_shards(local_v_heads: 
         dt_bias,
         recurrent_state,
         state_indices=state_indices,
+        config=config,
+        backend="cudac",
+    )
+    out_3d_gate, state_3d_gate = qwen35_layout_scalar_kda_decode(
+        mixed_qkv,
+        a.unsqueeze(1),
+        b.unsqueeze(1),
+        A_log,
+        dt_bias,
+        recurrent_state,
+        state_indices=state_indices,
+        config=config,
         backend="cudac",
     )
 
@@ -402,6 +579,8 @@ def test_qwen35_layout_scalar_kda_cudac_supports_local_tp_shards(local_v_heads: 
     torch.testing.assert_close(b_kernel, b_ref)
     torch.testing.assert_close(out.float(), out_ref.float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(state, state_ref, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(out_3d_gate, out)
+    torch.testing.assert_close(state_3d_gate, state)
 
 
 @pytest.mark.skipif(not _has_qwen35_cudac(), reason="Qwen3.5 CUDA decode backend is not available")
